@@ -1,4 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { Canvas, useThree } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import * as THREE from "three";
 
 /* ── Color palette (40 clusters) ── */
 const PALETTE = [
@@ -25,8 +28,135 @@ function similarityColor(sim) {
   return `rgb(${Math.round(20 + 60 * t)},${Math.round(20 + 20 * t)},${Math.round(50 + 130 * t)})`;
 }
 
-/* ── Lerp helper ── */
-function lerp(a, b, t) { return a + (b - a) * t; }
+/* ── 3D Point Cloud (rendered inside R3F Canvas) ── */
+function PointCloud({
+  abstracts, embeddings, filteredSet, searchSimilarity,
+  clusterColors, hoveredId, selectedId, onHover, onSelect, onTooltipPos,
+}) {
+  const pointsRef = useRef();
+  const geomRef = useRef();
+  const { camera, size, raycaster } = useThree();
+  const N = embeddings.length;
+
+  // Set raycaster threshold for small points
+  useEffect(() => {
+    if (!raycaster.params.Points) raycaster.params.Points = {};
+    raycaster.params.Points.threshold = 0.015;
+  }, [raycaster]);
+
+  // Position buffer — built once
+  const positions = useMemo(() => {
+    const arr = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) {
+      arr[i * 3]     = embeddings[i].x - 0.5;
+      arr[i * 3 + 1] = embeddings[i].y - 0.5;
+      arr[i * 3 + 2] = (embeddings[i].z ?? 0) - 0.5;
+    }
+    return arr;
+  }, [embeddings, N]);
+
+  // Color buffer — recomputed when filters/search change
+  const colors = useMemo(() => {
+    const arr = new Float32Array(N * 3);
+    const c = new THREE.Color();
+    for (let i = 0; i < N; i++) {
+      const a = abstracts[i];
+      let hex;
+      if (!filteredSet.has(i)) {
+        hex = "#1a1e28";
+      } else if (searchSimilarity) {
+        hex = similarityColor(searchSimilarity[i]);
+      } else {
+        hex = clusterColors[a.cluster] || "#ffffff";
+      }
+      c.set(hex);
+      arr[i * 3]     = c.r;
+      arr[i * 3 + 1] = c.g;
+      arr[i * 3 + 2] = c.b;
+    }
+    return arr;
+  }, [abstracts, N, filteredSet, searchSimilarity, clusterColors]);
+
+  // Apply geometry imperatively for reliable buffer updates
+  useEffect(() => {
+    if (!geomRef.current) return;
+    geomRef.current.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geomRef.current.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geomRef.current.computeBoundingSphere();
+  }, [positions, colors]);
+
+  // Update only colors when they change (positions are stable)
+  useEffect(() => {
+    if (!geomRef.current || !geomRef.current.attributes.color) return;
+    geomRef.current.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  }, [colors]);
+
+  const handlePointerMove = useCallback((e) => {
+    e.stopPropagation();
+    const i = e.index;
+    if (i == null) return;
+    onHover(i);
+    const emb = embeddings[i];
+    if (emb) {
+      const vec = new THREE.Vector3(emb.x - 0.5, emb.y - 0.5, (emb.z ?? 0) - 0.5);
+      vec.project(camera);
+      const sx = (vec.x * 0.5 + 0.5) * size.width;
+      const sy = (-vec.y * 0.5 + 0.5) * size.height;
+      onTooltipPos({ sx, sy, abstract: abstracts[i] });
+    }
+  }, [camera, size, embeddings, abstracts, onHover, onTooltipPos]);
+
+  const handlePointerOut = useCallback(() => {
+    onHover(null);
+    onTooltipPos(null);
+  }, [onHover, onTooltipPos]);
+
+  const handleClick = useCallback((e) => {
+    e.stopPropagation();
+    onSelect(e.index ?? null);
+  }, [onSelect]);
+
+  const hovPos = (hoveredId !== null && embeddings[hoveredId])
+    ? [embeddings[hoveredId].x - 0.5, embeddings[hoveredId].y - 0.5, (embeddings[hoveredId].z ?? 0) - 0.5]
+    : null;
+  const selPos = (selectedId !== null && embeddings[selectedId])
+    ? [embeddings[selectedId].x - 0.5, embeddings[selectedId].y - 0.5, (embeddings[selectedId].z ?? 0) - 0.5]
+    : null;
+
+  return (
+    <>
+      <points
+        ref={pointsRef}
+        onPointerMove={handlePointerMove}
+        onPointerOut={handlePointerOut}
+        onClick={handleClick}
+      >
+        <bufferGeometry ref={geomRef} />
+        <pointsMaterial vertexColors size={0.012} sizeAttenuation transparent opacity={0.9} depthWrite={false} />
+      </points>
+
+      {hovPos && (
+        <mesh position={hovPos}>
+          <sphereGeometry args={[0.018, 12, 12]} />
+          <meshBasicMaterial
+            color={clusterColors[abstracts[hoveredId]?.cluster] || "#ffffff"}
+            transparent opacity={0.6}
+          />
+        </mesh>
+      )}
+
+      {selPos && (
+        <mesh position={selPos}>
+          <sphereGeometry args={[0.026, 16, 16]} />
+          <meshBasicMaterial
+            color={clusterColors[abstracts[selectedId]?.cluster] || "#ffffff"}
+            transparent opacity={0.85}
+          />
+        </mesh>
+      )}
+    </>
+  );
+}
 
 /* ── Main App ── */
 export default function AACRExplorer() {
@@ -35,11 +165,6 @@ export default function AACRExplorer() {
   const [loading, setLoading] = useState(true);
   const [loadingStatus, setLoadingStatus] = useState("Fetching abstracts...");
 
-  const canvasRef = useRef(null);
-  const containerRef = useRef(null);
-  const [dimensions, setDimensions] = useState({ w: window.innerWidth, h: window.innerHeight });
-  const dimensionsRef = useRef({ w: window.innerWidth, h: window.innerHeight });
-  const [camera, setCamera] = useState({ x: 0, y: 0, zoom: 1 });
   const [hoveredId, setHoveredId] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [favorites, setFavorites] = useState(new Set());
@@ -54,53 +179,8 @@ export default function AACRExplorer() {
   const [tablePage, setTablePage] = useState(0);
   const TABLE_PAGE_SIZE = 50;
 
-  const dragRef = useRef({ dragging: false, lastX: 0, lastY: 0, moved: false });
-
-  // Smooth zoom animation
-  const animCameraRef = useRef({ x: 0, y: 0, zoom: 1 });
-  const targetCameraRef = useRef({ x: 0, y: 0, zoom: 1 });
-  const animFrameRef = useRef(null);
-
-  const animateCamera = useCallback(() => {
-    const cur = animCameraRef.current;
-    const tgt = targetCameraRef.current;
-    const t = 0.25; // interpolation speed
-    const nx = lerp(cur.x, tgt.x, t);
-    const ny = lerp(cur.y, tgt.y, t);
-    const nz = lerp(cur.zoom, tgt.zoom, t);
-    animCameraRef.current = { x: nx, y: ny, zoom: nz };
-
-    const dx = Math.abs(nx - tgt.x);
-    const dy = Math.abs(ny - tgt.y);
-    const dz = Math.abs(nz - tgt.zoom);
-    setCamera({ x: nx, y: ny, zoom: nz });
-
-    if (dx > 0.1 || dy > 0.1 || dz > 0.001) {
-      animFrameRef.current = requestAnimationFrame(animateCamera);
-    } else {
-      animCameraRef.current = { ...tgt };
-      setCamera({ ...tgt });
-      animFrameRef.current = null;
-    }
-  }, []);
-
-  const smoothSetCamera = useCallback((updater) => {
-    const cur = targetCameraRef.current;
-    const next = typeof updater === "function" ? updater(cur) : updater;
-    targetCameraRef.current = next;
-    if (!animFrameRef.current) {
-      animFrameRef.current = requestAnimationFrame(animateCamera);
-    }
-  }, [animateCamera]);
-
-  // Direct camera set (for drag — no animation)
-  const directSetCamera = useCallback((updater) => {
-    const cur = animCameraRef.current;
-    const next = typeof updater === "function" ? updater(cur) : updater;
-    animCameraRef.current = next;
-    targetCameraRef.current = next;
-    setCamera(next);
-  }, []);
+  const orbitControlsRef = useRef(null);
+  const handleReset = useCallback(() => orbitControlsRef.current?.reset(), []);
 
   // Load precomputed data
   useEffect(() => {
@@ -109,7 +189,7 @@ export default function AACRExplorer() {
         const resp = await fetch(import.meta.env.BASE_URL + "aacr_data.json");
         const data = await resp.json();
         setLoadingStatus(`Loading ${data.length} abstracts...`);
-        const emb = data.map((d) => ({ x: d.x, y: d.y }));
+        const emb = data.map((d) => ({ x: d.x, y: d.y, z: d.z ?? 0.5 }));
         setAbstracts(data);
         setEmbeddings(emb);
         setLoading(false);
@@ -141,24 +221,6 @@ export default function AACRExplorer() {
     });
   }, [saveFavorites]);
 
-  // Resize
-  const dprRef = useRef(window.devicePixelRatio || 1);
-  useEffect(() => {
-    const update = () => {
-      if (!containerRef.current) return;
-      const { width, height } = containerRef.current.getBoundingClientRect();
-      dprRef.current = window.devicePixelRatio || 1;
-      dimensionsRef.current = { w: width, h: height };
-      setDimensions({ w: width, h: height });
-    };
-    const obs = new ResizeObserver(update);
-    if (containerRef.current) obs.observe(containerRef.current);
-    const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
-    const onDprChange = () => update();
-    mq.addEventListener?.("change", onDprChange);
-    return () => { obs.disconnect(); mq.removeEventListener?.("change", onDprChange); };
-  }, []);
-
   // Derived data
   const clusterTopics = useMemo(() => {
     const counts = {};
@@ -186,25 +248,20 @@ export default function AACRExplorer() {
     return colors;
   }, [abstracts, clusterColors]);
 
-  // Search-based similarity: compute distance from centroid of search matches
+  // Search similarity: 3D centroid distance
   const searchSimilarity = useMemo(() => {
     if (!searchTerm || searchTerm.length < 2 || embeddings.length === 0) return null;
     const term = searchTerm.toLowerCase();
-    // Find matching indices
     const matches = [];
     abstracts.forEach((a, i) => {
       if (a.title.toLowerCase().includes(term) || a.authors.join(" ").toLowerCase().includes(term) || a.id.toLowerCase().includes(term) || a.presenter.toLowerCase().includes(term))
         matches.push(i);
     });
     if (matches.length === 0) return null;
-
-    // Compute centroid of matches in 2D
-    let cx = 0, cy = 0;
-    matches.forEach((i) => { cx += embeddings[i].x; cy += embeddings[i].y; });
-    cx /= matches.length; cy /= matches.length;
-
-    // Distance from every point to centroid
-    const dists = embeddings.map((e) => Math.hypot(e.x - cx, e.y - cy));
+    let cx = 0, cy = 0, cz = 0;
+    matches.forEach((i) => { cx += embeddings[i].x; cy += embeddings[i].y; cz += embeddings[i].z; });
+    cx /= matches.length; cy /= matches.length; cz /= matches.length;
+    const dists = embeddings.map((e) => Math.hypot(e.x - cx, e.y - cy, e.z - cz));
     const maxDist = Math.max(...dists) || 1;
     return dists.map((d) => 1 - d / maxDist);
   }, [searchTerm, abstracts, embeddings]);
@@ -224,159 +281,7 @@ export default function AACRExplorer() {
 
   const filteredSet = useMemo(() => new Set(filteredIndices), [filteredIndices]);
 
-  // World -> Screen
-  const worldToScreen = useCallback((wx, wy) => {
-    const margin = 60;
-    const scale = Math.min(dimensions.w - margin * 2, dimensions.h - margin * 2) * camera.zoom;
-    return {
-      sx: dimensions.w / 2 + (wx - 0.5) * scale + camera.x,
-      sy: dimensions.h / 2 + (wy - 0.5) * scale + camera.y,
-    };
-  }, [dimensions, camera]);
-
-  // Canvas render
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas || abstracts.length === 0 || embeddings.length === 0) return;
-    const ctx = canvas.getContext("2d");
-    const dpr = dprRef.current;
-    const bufW = Math.round(dimensions.w * dpr);
-    const bufH = Math.round(dimensions.h * dpr);
-    if (canvas.width !== bufW || canvas.height !== bufH) { canvas.width = bufW; canvas.height = bufH; }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    ctx.fillStyle = "#08090d";
-    ctx.fillRect(0, 0, dimensions.w, dimensions.h);
-
-    // Grid
-    ctx.strokeStyle = "rgba(255,255,255,0.02)";
-    ctx.lineWidth = 1;
-    const gridStep = 50 * camera.zoom;
-    const offsetX = (((camera.x % gridStep) + gridStep) % gridStep);
-    const offsetY = (((camera.y % gridStep) + gridStep) % gridStep);
-    for (let x = offsetX; x < dimensions.w; x += gridStep) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, dimensions.h); ctx.stroke(); }
-    for (let y = offsetY; y < dimensions.h; y += gridStep) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(dimensions.w, y); ctx.stroke(); }
-
-    const baseRadius = Math.max(2, 3 * camera.zoom);
-    const useSimilarity = searchSimilarity !== null;
-
-    // Dimmed (non-filtered) points
-    abstracts.forEach((a, i) => {
-      if (filteredSet.has(i)) return;
-      const { sx, sy } = worldToScreen(embeddings[i].x, embeddings[i].y);
-      if (sx < -20 || sx > dimensions.w + 20 || sy < -20 || sy > dimensions.h + 20) return;
-      ctx.beginPath();
-      ctx.arc(sx, sy, baseRadius * 0.5, 0, Math.PI * 2);
-      ctx.fillStyle = useSimilarity ? similarityColor(searchSimilarity[i] * 0.3) : "rgba(255,255,255,0.04)";
-      ctx.fill();
-    });
-
-    // Active points
-    filteredIndices.forEach((i) => {
-      const a = abstracts[i];
-      const { sx, sy } = worldToScreen(embeddings[i].x, embeddings[i].y);
-      if (sx < -20 || sx > dimensions.w + 20 || sy < -20 || sy > dimensions.h + 20) return;
-
-      const color = useSimilarity ? similarityColor(searchSimilarity[i]) : (clusterColors[a.cluster] || "#ffffff");
-      const isFav = favorites.has(a.id);
-      const isHovered = hoveredId === i;
-      const isSelected = selectedId === i;
-      const r = isHovered || isSelected ? baseRadius * 2 : isFav ? baseRadius * 1.4 : baseRadius;
-
-      if (isHovered || isSelected) {
-        const grad = ctx.createRadialGradient(sx, sy, r, sx, sy, r + 14);
-        grad.addColorStop(0, (useSimilarity ? "#ffffff" : color) + "33");
-        grad.addColorStop(1, (useSimilarity ? "#ffffff" : color) + "00");
-        ctx.beginPath();
-        ctx.arc(sx, sy, r + 14, 0, Math.PI * 2);
-        ctx.fillStyle = grad;
-        ctx.fill();
-      }
-
-      ctx.beginPath();
-      ctx.arc(sx, sy, r, 0, Math.PI * 2);
-      ctx.fillStyle = isHovered || isSelected ? color : color + (useSimilarity ? "" : "bb");
-      ctx.fill();
-
-      if (isFav) {
-        ctx.beginPath();
-        ctx.arc(sx, sy, r + 3, 0, Math.PI * 2);
-        ctx.strokeStyle = "#ffd93d88";
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      }
-    });
-
-    // Crosshair
-    ctx.strokeStyle = "rgba(255,255,255,0.04)";
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 8]);
-    ctx.beginPath(); ctx.moveTo(dimensions.w / 2, 0); ctx.lineTo(dimensions.w / 2, dimensions.h); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0, dimensions.h / 2); ctx.lineTo(dimensions.w, dimensions.h / 2); ctx.stroke();
-    ctx.setLineDash([]);
-  }, [dimensions, camera, abstracts, embeddings, filteredIndices, filteredSet, favorites, hoveredId, selectedId, worldToScreen, clusterColors, searchSimilarity]);
-
-  // Hit test
-  const hitTest = useCallback((mx, my) => {
-    const baseRadius = Math.max(2, 3 * camera.zoom);
-    let closest = -1, closestDist = Infinity;
-    filteredIndices.forEach((i) => {
-      const { sx, sy } = worldToScreen(embeddings[i].x, embeddings[i].y);
-      const d = Math.hypot(mx - sx, my - sy);
-      if (d < Math.max(baseRadius * 3, 14) && d < closestDist) { closest = i; closestDist = d; }
-    });
-    return closest;
-  }, [camera, filteredIndices, embeddings, worldToScreen]);
-
-  // Mouse handlers
-  const handleMouseDown = (e) => { dragRef.current = { dragging: true, lastX: e.clientX, lastY: e.clientY, moved: false }; };
-  const handleMouseMove = (e) => {
-    const rect = canvasRef.current.getBoundingClientRect();
-    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    if (dragRef.current.dragging) {
-      const dx = e.clientX - dragRef.current.lastX, dy = e.clientY - dragRef.current.lastY;
-      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragRef.current.moved = true;
-      directSetCamera((c) => ({ ...c, x: c.x + dx, y: c.y + dy }));
-      dragRef.current.lastX = e.clientX; dragRef.current.lastY = e.clientY;
-      setHoveredId(null); setTooltipData(null);
-      return;
-    }
-    const hit = hitTest(mx, my);
-    setHoveredId(hit >= 0 ? hit : null);
-    setTooltipData(hit >= 0 ? { x: mx, y: my, abstract: abstracts[hit] } : null);
-  };
-  const handleMouseUp = () => { dragRef.current.dragging = false; };
-  const handleClick = (e) => {
-    if (dragRef.current.moved) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    const hit = hitTest(e.clientX - rect.left, e.clientY - rect.top);
-    setSelectedId(hit >= 0 ? hit : null);
-  };
-
-  // Wheel zoom — smooth animated, centered at cursor
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const onWheel = (e) => {
-      e.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      const { w, h } = dimensionsRef.current;
-      // ox/oy: cursor position relative to canvas center (same space as camera.x/y)
-      const ox = (e.clientX - rect.left) - w / 2;
-      const oy = (e.clientY - rect.top) - h / 2;
-      const factor = e.deltaY > 0 ? 0.85 : 1.18;
-      smoothSetCamera((c) => {
-        const newZoom = Math.max(0.2, Math.min(10, c.zoom * factor));
-        const scale = newZoom / c.zoom;
-        return { x: ox - scale * (ox - c.x), y: oy - scale * (oy - c.y), zoom: newZoom };
-      });
-    };
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    return () => canvas.removeEventListener("wheel", onWheel);
-  }, [loading, smoothSetCamera]);
-
   // Table resize drag
-  const tableResizeRef = useRef(null);
   const handleTableResizeStart = (e) => {
     e.preventDefault();
     const startY = e.clientY;
@@ -514,20 +419,41 @@ export default function AACRExplorer() {
         <button className={`ctrl-btn ${showTable ? "active" : ""}`} onClick={() => { setShowTable(!showTable); setTablePage(0); }}>Table</button>
         <button className="ctrl-btn" onClick={() => exportCSV(false)}>↓ All</button>
         <button className="ctrl-btn" onClick={() => exportCSV(true)}>↓ Favs</button>
-        <button className="ctrl-btn" onClick={() => { smoothSetCamera({ x: 0, y: 0, zoom: 1 }); }}>Reset</button>
+        <button className="ctrl-btn" onClick={handleReset}>Reset</button>
         <span className="stat"><b>{filteredIndices.length}</b> / {abstracts.length}</span>
       </div>
 
-      {/* Canvas */}
-      <div ref={containerRef} style={{ position: "absolute", inset: 0, cursor: dragRef.current.dragging ? "grabbing" : "crosshair" }}>
-        <canvas ref={canvasRef} style={{ width: dimensions.w, height: dimensions.h, display: "block" }}
-          onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp}
-          onMouseLeave={() => { handleMouseUp(); setHoveredId(null); setTooltipData(null); }} onClick={handleClick} />
-      </div>
+      {/* 3D Canvas */}
+      <Canvas
+        camera={{ position: [0, 0, 2], fov: 60, near: 0.01, far: 100 }}
+        style={{ position: "absolute", inset: 0 }}
+        gl={{ antialias: true }}
+      >
+        <color attach="background" args={["#08090d"]} />
+        <PointCloud
+          abstracts={abstracts}
+          embeddings={embeddings}
+          filteredSet={filteredSet}
+          searchSimilarity={searchSimilarity}
+          clusterColors={clusterColors}
+          hoveredId={hoveredId}
+          selectedId={selectedId}
+          onHover={setHoveredId}
+          onSelect={setSelectedId}
+          onTooltipPos={setTooltipData}
+        />
+        <OrbitControls
+          ref={orbitControlsRef}
+          enableDamping
+          dampingFactor={0.05}
+          minDistance={0.3}
+          maxDistance={6}
+        />
+      </Canvas>
 
       {/* Tooltip */}
       {tooltipData && !selected && (
-        <div className="tooltip" style={{ left: Math.min(tooltipData.x + 16, dimensions.w - 480), top: tooltipData.y + 16 }}>
+        <div className="tooltip" style={{ left: Math.min(tooltipData.sx + 16, window.innerWidth - 480), top: Math.min(tooltipData.sy + 16, window.innerHeight - 120) }}>
           <h4>{tooltipData.abstract.title}</h4>
           <p>{tooltipData.abstract.authors.slice(0, 3).join(", ")}{tooltipData.abstract.authors.length > 3 ? " et al." : ""}</p>
           <p style={{ color: topicColors[tooltipData.abstract.clusterTopic], marginTop: 2 }}>{tooltipData.abstract.clusterTopic} · #{tooltipData.abstract.posterNumber}</p>
@@ -603,8 +529,8 @@ export default function AACRExplorer() {
         </div>
       )}
 
-      {/* Zoom Info */}
-      {!showTable && <div className="zoom-info">{(camera.zoom * 100).toFixed(0)}% · SCROLL ZOOM · DRAG PAN</div>}
+      {/* Controls hint */}
+      {!showTable && <div className="zoom-info">DRAG ROTATE · SCROLL ZOOM · RIGHT-DRAG PAN</div>}
     </div>
   );
 }

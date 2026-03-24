@@ -54,18 +54,18 @@ print(f"Embeddings shape: {embeddings.shape}")
 
 # ── Step 2: UMAP to 2D ──────────────────────────────────────────────────────
 
-print("Running UMAP reduction to 2D...")
+print("Running UMAP reduction to 3D...")
 reducer = UMAP(
-    n_components=2, n_neighbors=30, min_dist=0.1,
+    n_components=3, n_neighbors=30, min_dist=0.1,
     metric="cosine", random_state=42
 )
-coords_2d = reducer.fit_transform(embeddings)
+coords_3d = reducer.fit_transform(embeddings)
 
-mins = coords_2d.min(axis=0)
-maxs = coords_2d.max(axis=0)
+mins = coords_3d.min(axis=0)
+maxs = coords_3d.max(axis=0)
 ranges = maxs - mins
 ranges[ranges == 0] = 1
-coords_norm = (coords_2d - mins) / ranges
+coords_norm = (coords_3d - mins) / ranges
 
 # ── Step 3: Extract topics via clustering + TF-IDF + semantic ranking ────────
 
@@ -107,6 +107,7 @@ for c in range(N_CLUSTERS):
 for i, a in enumerate(abstracts):
     a["x"] = round(float(coords_norm[i, 0]), 5)
     a["y"] = round(float(coords_norm[i, 1]), 5)
+    a["z"] = round(float(coords_norm[i, 2]), 5)
     a["cluster"] = int(labels[i])
     a["clusterTopic"] = cluster_topic_labels[int(labels[i])]
 
