@@ -1,0 +1,9 @@
+node_modules/
+app/node_modules/
+dist/
+app/dist/
+*.local
+
+# Raw scrape data (not needed by app)
+aacr_abstracts.json
+app/public/aacr_abstracts.json
