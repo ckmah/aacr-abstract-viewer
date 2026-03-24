@@ -1,17 +1,22 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
+import { Canvas, useThree, useFrame } from "@react-three/fiber";
+import { OrbitControls, GizmoHelper, GizmoViewport, Line } from "@react-three/drei";
+import { EffectComposer as PPComposer, RenderPass, SMAAEffect, EffectPass } from "postprocessing";
+import { N8AOPostPass } from "n8ao";
 import * as THREE from "three";
 
-/* ── Color palette (40 clusters) ── */
+/* ── Color palette (40 clusters) — vibrant, dark-theme optimized ── */
 const PALETTE = [
-  "#00ff9f", "#00b8ff", "#ff6b6b", "#ffd93d", "#c084fc", "#fb923c",
-  "#34d399", "#f472b6", "#60a5fa", "#a78bfa", "#facc15", "#4ade80",
-  "#f87171", "#38bdf8", "#e879f9", "#f97316", "#14b8a6", "#8b5cf6",
-  "#ef4444", "#06b6d4", "#d946ef", "#22d3ee", "#a3e635", "#f59e0b",
-  "#10b981", "#ec4899", "#6366f1", "#84cc16", "#f43f5e", "#0ea5e9",
-  "#a855f7", "#eab308", "#14b8a6", "#e11d48", "#7c3aed", "#2dd4bf",
-  "#fb7185", "#818cf8", "#fbbf24", "#4f46e5",
+  "#ff4757", "#ff6b81", "#ff7f50", "#ff9f43",
+  "#ffd32a", "#ffdd59", "#7bed9f", "#adff2f",
+  "#2ed573", "#1dd1a1", "#00d2d3", "#48dbfb",
+  "#54a0ff", "#1e90ff", "#5352ed", "#3742fa",
+  "#a29bfe", "#6c5ce7", "#8854d0", "#be2edd",
+  "#e84393", "#fd79a8", "#f368e0", "#ff9ff3",
+  "#e17055", "#fdcb6e", "#f9ca24", "#badc58",
+  "#26de81", "#01abc7", "#0652dd", "#00b894",
+  "#ff6348", "#eccc68", "#45aaf2", "#ff4081",
+  "#2bcbba", "#ee5a24", "#f8b739", "#778beb",
 ];
 
 /* ── Similarity heat color (blue → orange → white) ── */
@@ -28,23 +33,20 @@ function similarityColor(sim) {
   return `rgb(${Math.round(20 + 60 * t)},${Math.round(20 + 20 * t)},${Math.round(50 + 130 * t)})`;
 }
 
-/* ── 3D Point Cloud (rendered inside R3F Canvas) ── */
+/* ── Point Cloud ── */
 function PointCloud({
-  abstracts, embeddings, filteredSet, searchSimilarity,
+  abstracts, embeddings, filteredSet, filteredIndices, searchSimilarity,
   clusterColors, hoveredId, selectedId, onHover, onSelect, onTooltipPos,
 }) {
-  const pointsRef = useRef();
   const geomRef = useRef();
   const { camera, size, raycaster } = useThree();
   const N = embeddings.length;
 
-  // Set raycaster threshold for small points
   useEffect(() => {
     if (!raycaster.params.Points) raycaster.params.Points = {};
-    raycaster.params.Points.threshold = 0.015;
+    raycaster.params.Points.threshold = 0.01;
   }, [raycaster]);
 
-  // Position buffer — built once
   const positions = useMemo(() => {
     const arr = new Float32Array(N * 3);
     for (let i = 0; i < N; i++) {
@@ -55,20 +57,13 @@ function PointCloud({
     return arr;
   }, [embeddings, N]);
 
-  // Color buffer — recomputed when filters/search change
-  const colors = useMemo(() => {
+  const baseColors = useMemo(() => {
     const arr = new Float32Array(N * 3);
     const c = new THREE.Color();
     for (let i = 0; i < N; i++) {
-      const a = abstracts[i];
-      let hex;
-      if (!filteredSet.has(i)) {
-        hex = "#1a1e28";
-      } else if (searchSimilarity) {
-        hex = similarityColor(searchSimilarity[i]);
-      } else {
-        hex = clusterColors[a.cluster] || "#ffffff";
-      }
+      const hex = !filteredSet.has(i) ? "#1a1e28"
+        : searchSimilarity ? similarityColor(searchSimilarity[i])
+        : (clusterColors[abstracts[i].cluster] || "#c8d8ff");
       c.set(hex);
       arr[i * 3]     = c.r;
       arr[i * 3 + 1] = c.g;
@@ -77,19 +72,58 @@ function PointCloud({
     return arr;
   }, [abstracts, N, filteredSet, searchSimilarity, clusterColors]);
 
-  // Apply geometry imperatively for reliable buffer updates
   useEffect(() => {
     if (!geomRef.current) return;
     geomRef.current.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geomRef.current.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    const colAttr = new THREE.BufferAttribute(new Float32Array(N * 3), 3);
+    colAttr.setUsage(THREE.DynamicDrawUsage);
+    geomRef.current.setAttribute("color", colAttr);
     geomRef.current.computeBoundingSphere();
-  }, [positions, colors]);
+  }, [positions, N]);
 
-  // Update only colors when they change (positions are stable)
-  useEffect(() => {
-    if (!geomRef.current || !geomRef.current.attributes.color) return;
-    geomRef.current.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-  }, [colors]);
+  useFrame(({ camera }) => {
+    if (!geomRef.current?.attributes.color) return;
+    const colAttr = geomRef.current.attributes.color;
+    const arr = colAttr.array;
+    const cx = camera.position.x, cy = camera.position.y, cz = camera.position.z;
+    let minD2 = Infinity;
+    for (let i = 0; i < N; i++) {
+      const dx = positions[i*3] - cx, dy = positions[i*3+1] - cy, dz = positions[i*3+2] - cz;
+      const d2 = dx*dx + dy*dy + dz*dz;
+      if (d2 < minD2) minD2 = d2;
+    }
+    const minDist = Math.sqrt(minD2);
+    for (let i = 0; i < N; i++) {
+      const dx = positions[i*3] - cx, dy = positions[i*3+1] - cy, dz = positions[i*3+2] - cz;
+      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      const brightness = Math.max(0.12, Math.exp(-3.5 * (dist - minDist)));
+      arr[i*3]   = baseColors[i*3]   * brightness;
+      arr[i*3+1] = baseColors[i*3+1] * brightness;
+      arr[i*3+2] = baseColors[i*3+2] * brightness;
+    }
+    colAttr.needsUpdate = true;
+  });
+
+  // Nearest neighbors for hover lines
+  const nearestNeighbors = useMemo(() => {
+    if (hoveredId === null || !embeddings[hoveredId]) return [];
+    const hx = embeddings[hoveredId].x - 0.5;
+    const hy = embeddings[hoveredId].y - 0.5;
+    const hz = (embeddings[hoveredId].z ?? 0) - 0.5;
+    return filteredIndices
+      .filter(i => i !== hoveredId)
+      .map(i => ({
+        i,
+        d: Math.hypot(
+          embeddings[i].x - 0.5 - hx,
+          embeddings[i].y - 0.5 - hy,
+          (embeddings[i].z ?? 0) - 0.5 - hz,
+        ),
+      }))
+      .sort((a, b) => a.d - b.d)
+      .slice(0, 8)
+      .map(({ i }) => i);
+  }, [hoveredId, embeddings, filteredIndices]);
 
   const handlePointerMove = useCallback((e) => {
     e.stopPropagation();
@@ -100,9 +134,7 @@ function PointCloud({
     if (emb) {
       const vec = new THREE.Vector3(emb.x - 0.5, emb.y - 0.5, (emb.z ?? 0) - 0.5);
       vec.project(camera);
-      const sx = (vec.x * 0.5 + 0.5) * size.width;
-      const sy = (-vec.y * 0.5 + 0.5) * size.height;
-      onTooltipPos({ sx, sy, abstract: abstracts[i] });
+      onTooltipPos({ sx: (vec.x * 0.5 + 0.5) * size.width, sy: (-vec.y * 0.5 + 0.5) * size.height, abstract: abstracts[i] });
     }
   }, [camera, size, embeddings, abstracts, onHover, onTooltipPos]);
 
@@ -116,46 +148,164 @@ function PointCloud({
     onSelect(e.index ?? null);
   }, [onSelect]);
 
-  const hovPos = (hoveredId !== null && embeddings[hoveredId])
-    ? [embeddings[hoveredId].x - 0.5, embeddings[hoveredId].y - 0.5, (embeddings[hoveredId].z ?? 0) - 0.5]
-    : null;
-  const selPos = (selectedId !== null && embeddings[selectedId])
-    ? [embeddings[selectedId].x - 0.5, embeddings[selectedId].y - 0.5, (embeddings[selectedId].z ?? 0) - 0.5]
-    : null;
+  const circleTexture = useMemo(() => {
+    const sz = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = sz; canvas.height = sz;
+    const ctx = canvas.getContext("2d");
+    // Black border ring
+    ctx.beginPath();
+    ctx.arc(sz / 2, sz / 2, sz / 2 - 2, 0, Math.PI * 2);
+    ctx.fillStyle = "#000000";
+    ctx.fill();
+    // White interior (tinted by vertex color at render time)
+    ctx.beginPath();
+    ctx.arc(sz / 2, sz / 2, sz / 2 - 6, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
+    return tex;
+  }, []);
+
+  const glowTexture = useMemo(() => {
+    const sz = 32;
+    const canvas = document.createElement("canvas");
+    canvas.width = sz; canvas.height = sz;
+    const ctx = canvas.getContext("2d");
+    const grad = ctx.createRadialGradient(sz/2, sz/2, 0, sz/2, sz/2, sz/2);
+    grad.addColorStop(0,   "rgba(255,255,255,1)");
+    grad.addColorStop(0.3, "rgba(255,255,255,0.6)");
+    grad.addColorStop(1,   "rgba(255,255,255,0)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, sz, sz);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
+    return tex;
+  }, []);
+
+  const glowGeomRef = useRef();
+  useEffect(() => {
+    if (!glowGeomRef.current) return;
+    const selEmb = selectedId !== null ? embeddings[selectedId] : null;
+    if (selEmb) {
+      const pos = new Float32Array([selEmb.x - 0.5, selEmb.y - 0.5, (selEmb.z ?? 0) - 0.5]);
+      glowGeomRef.current.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      glowGeomRef.current.setDrawRange(0, 1);
+      glowGeomRef.current.computeBoundingSphere();
+    } else {
+      glowGeomRef.current.setDrawRange(0, 0);
+    }
+  }, [selectedId, embeddings]);
+
+  const hovEmb = hoveredId !== null ? embeddings[hoveredId] : null;
+  const hovPos = hovEmb ? [hovEmb.x - 0.5, hovEmb.y - 0.5, (hovEmb.z ?? 0) - 0.5] : null;
 
   return (
     <>
-      <points
-        ref={pointsRef}
-        onPointerMove={handlePointerMove}
-        onPointerOut={handlePointerOut}
-        onClick={handleClick}
-      >
+      <points onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onClick={handleClick}>
         <bufferGeometry ref={geomRef} />
-        <pointsMaterial vertexColors size={0.012} sizeAttenuation transparent opacity={0.9} depthWrite={false} />
+        <pointsMaterial
+          map={circleTexture}
+          vertexColors
+          size={0.012}
+          sizeAttenuation
+          alphaTest={0.9}
+        />
       </points>
 
-      {hovPos && (
-        <mesh position={hovPos}>
-          <sphereGeometry args={[0.018, 12, 12]} />
-          <meshBasicMaterial
-            color={clusterColors[abstracts[hoveredId]?.cluster] || "#ffffff"}
-            transparent opacity={0.6}
-          />
-        </mesh>
-      )}
+      {/* Selection glow */}
+      <points frustumCulled={false}>
+        <bufferGeometry ref={glowGeomRef} />
+        <pointsMaterial
+          map={glowTexture}
+          color="#c8d8ff"
+          size={0.04}
+          sizeAttenuation
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          transparent
+        />
+      </points>
 
-      {selPos && (
-        <mesh position={selPos}>
-          <sphereGeometry args={[0.026, 16, 16]} />
-          <meshBasicMaterial
-            color={clusterColors[abstracts[selectedId]?.cluster] || "#ffffff"}
-            transparent opacity={0.85}
-          />
-        </mesh>
-      )}
+      {/* Nearest neighbor lines */}
+      {hovPos && nearestNeighbors.map((ni, idx) => (
+        <Line key={idx}
+          points={[hovPos, [embeddings[ni].x - 0.5, embeddings[ni].y - 0.5, (embeddings[ni].z ?? 0) - 0.5]]}
+          color="#ffffff" lineWidth={1.2} transparent opacity={0.45}
+        />
+      ))}
     </>
   );
+}
+
+
+
+
+/* ── Smooth zoom (lerps camera radial distance; OrbitControls handles direction) ── */
+function SmoothZoom({ minDist, maxDist }) {
+  const { camera, gl } = useThree();
+  const targetRef = useRef(null);
+
+  useEffect(() => {
+    const el = gl.domElement;
+    const onWheel = (e) => {
+      e.preventDefault();
+      const cur = targetRef.current ?? camera.position.length();
+      const factor = e.deltaY > 0 ? 1.1 : 1 / 1.1;
+      targetRef.current = Math.max(minDist, Math.min(maxDist, cur * factor));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [gl, camera, minDist, maxDist]);
+
+  useFrame(() => {
+    if (targetRef.current === null) return;
+    const cur = camera.position.length();
+    const next = cur + (targetRef.current - cur) * 0.12;
+    if (Math.abs(next - targetRef.current) < 0.001) {
+      camera.position.setLength(targetRef.current);
+      targetRef.current = null;
+    } else {
+      camera.position.setLength(next);
+    }
+  });
+
+  return null;
+}
+
+/* ── SSAO via N8AOPostPass (takes over render loop at priority 1) ── */
+function SSAO() {
+  const { gl, scene, camera, size } = useThree();
+  const composerRef = useRef(null);
+
+  useEffect(() => {
+    const isWebGL2 = gl.capabilities.isWebGL2;
+    const composer = new PPComposer(gl, undefined, {
+      multisampling: isWebGL2 ? 16 : 0,
+    });
+    composer.addPass(new RenderPass(scene, camera));
+    const aoPass = new N8AOPostPass(scene, camera, size.width, size.height);
+    aoPass.configuration.aoRadius = 0.25;
+    aoPass.configuration.distanceFalloff = 1.0;
+    aoPass.configuration.intensity = 8;
+    aoPass.setQualityMode("Medium");
+    composer.addPass(aoPass);
+    if (!isWebGL2) {
+      composer.addPass(new EffectPass(camera, new SMAAEffect()));
+    }
+    composerRef.current = composer;
+    return () => { composerRef.current = null; };
+  }, [gl, scene, camera]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    composerRef.current?.setSize(size.width, size.height);
+  }, [size]);
+
+  useFrame(() => { composerRef.current?.render(); }, 1);
+  return null;
 }
 
 /* ── Main App ── */
@@ -177,10 +327,44 @@ export default function AACRExplorer() {
   const [tableHeight, setTableHeight] = useState(350);
   const [tooltipData, setTooltipData] = useState(null);
   const [tablePage, setTablePage] = useState(0);
+  const [autoRotate, setAutoRotate] = useState(false);
+  const [spinPaused, setSpinPaused] = useState(false);
+  const spinResumeTimer = useRef(null);
   const TABLE_PAGE_SIZE = 50;
 
+  useEffect(() => {
+    clearTimeout(spinResumeTimer.current);
+    if (hoveredId !== null) {
+      setSpinPaused(true);
+    } else {
+      spinResumeTimer.current = setTimeout(() => setSpinPaused(false), 300);
+    }
+    return () => clearTimeout(spinResumeTimer.current);
+  }, [hoveredId]);
+
   const orbitControlsRef = useRef(null);
-  const handleReset = useCallback(() => orbitControlsRef.current?.reset(), []);
+
+  const handleReset = useCallback(() => { orbitControlsRef.current?.reset(); }, []);
+
+  // Shift key → lock horizontal orbit
+  useEffect(() => {
+    const onDown = (e) => {
+      if (e.key === "Shift" && orbitControlsRef.current) {
+        const p = orbitControlsRef.current.getPolarAngle();
+        orbitControlsRef.current.minPolarAngle = p;
+        orbitControlsRef.current.maxPolarAngle = p;
+      }
+    };
+    const onUp = (e) => {
+      if (e.key === "Shift" && orbitControlsRef.current) {
+        orbitControlsRef.current.minPolarAngle = 0;
+        orbitControlsRef.current.maxPolarAngle = Math.PI;
+      }
+    };
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return () => { window.removeEventListener("keydown", onDown); window.removeEventListener("keyup", onUp); };
+  }, []);
 
   // Load precomputed data
   useEffect(() => {
@@ -189,9 +373,8 @@ export default function AACRExplorer() {
         const resp = await fetch(import.meta.env.BASE_URL + "aacr_data.json");
         const data = await resp.json();
         setLoadingStatus(`Loading ${data.length} abstracts...`);
-        const emb = data.map((d) => ({ x: d.x, y: d.y, z: d.z ?? 0.5 }));
         setAbstracts(data);
-        setEmbeddings(emb);
+        setEmbeddings(data.map((d) => ({ x: d.x, y: d.y, z: d.z ?? 0.5 })));
         setLoading(false);
       } catch (e) {
         setLoadingStatus(`Error: ${e.message}`);
@@ -248,6 +431,7 @@ export default function AACRExplorer() {
     return colors;
   }, [abstracts, clusterColors]);
 
+
   // Search similarity: 3D centroid distance
   const searchSimilarity = useMemo(() => {
     if (!searchTerm || searchTerm.length < 2 || embeddings.length === 0) return null;
@@ -281,15 +465,11 @@ export default function AACRExplorer() {
 
   const filteredSet = useMemo(() => new Set(filteredIndices), [filteredIndices]);
 
-  // Table resize drag
+  // Table resize
   const handleTableResizeStart = (e) => {
     e.preventDefault();
-    const startY = e.clientY;
-    const startH = tableHeight;
-    const onMove = (ev) => {
-      const delta = startY - ev.clientY;
-      setTableHeight(Math.max(150, Math.min(window.innerHeight * 0.8, startH + delta)));
-    };
+    const startY = e.clientY, startH = tableHeight;
+    const onMove = (ev) => setTableHeight(Math.max(150, Math.min(window.innerHeight * 0.8, startH + startY - ev.clientY)));
     const onUp = () => { document.removeEventListener("mousemove", onMove); document.removeEventListener("mouseup", onUp); };
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -306,10 +486,8 @@ export default function AACRExplorer() {
     const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href = url;
-    link.download = favOnly ? "aacr_abstracts_fav.csv" : "aacr_abstracts_all.csv";
-    link.click();
-    URL.revokeObjectURL(url);
+    link.href = url; link.download = favOnly ? "aacr_abstracts_fav.csv" : "aacr_abstracts_all.csv";
+    link.click(); URL.revokeObjectURL(url);
   };
 
   const selected = selectedId !== null ? abstracts[selectedId] : null;
@@ -320,10 +498,7 @@ export default function AACRExplorer() {
   if (loading) {
     return (
       <div style={{ width: "100vw", height: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#08090d", color: "#3a3e4a", fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
-        <style>{`
-          @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&family=DM+Sans:wght@400;500;600;700&display=swap');
-          @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
-        `}</style>
+        <style>{`@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&family=DM+Sans:wght@400;500;600;700&display=swap'); @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }`}</style>
         <div style={{ fontSize: 16, letterSpacing: 6, textTransform: "uppercase", marginBottom: 36, color: "#00ff9f", animation: "pulse 2s infinite" }}>AACR 2026 Explorer</div>
         <div style={{ fontSize: 18, color: "#2a2e3a" }}>{loadingStatus}</div>
       </div>
@@ -338,7 +513,6 @@ export default function AACRExplorer() {
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
-
         .ctrl-bar { position: absolute; top: 0; left: 0; right: 0; z-index: 10; display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: linear-gradient(180deg, rgba(8,9,13,0.97) 0%, rgba(8,9,13,0.85) 70%, transparent 100%); backdrop-filter: blur(12px); flex-wrap: wrap; }
         .ctrl-bar .logo { font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 20px; color: #00ff9f; letter-spacing: 4px; text-transform: uppercase; margin-right: 12px; white-space: nowrap; user-select: none; }
         .ctrl-bar .logo span { color: #1e2028; font-weight: 400; }
@@ -351,7 +525,6 @@ export default function AACRExplorer() {
         .ctrl-btn.active { background: rgba(0,255,159,0.1); border-color: rgba(0,255,159,0.4); color: #00ff9f; }
         .stat { font-size: 14px; color: #2a2e3a; letter-spacing: 2px; text-transform: uppercase; white-space: nowrap; }
         .stat b { color: #00ff9f; font-weight: 500; }
-
         .detail-panel { position: absolute; top: 60px; right: 0; bottom: 0; width: 560px; max-width: 90vw; background: rgba(8,9,13,0.97); backdrop-filter: blur(16px); border-left: 1px solid rgba(255,255,255,0.06); z-index: 20; overflow-y: auto; padding: 36px 32px; animation: slideIn 0.2s ease-out; }
         @keyframes slideIn { from { transform: translateX(40px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
         .detail-panel h2 { font-family: 'DM Sans', sans-serif; font-size: 22px; font-weight: 600; color: #e2e4ea; line-height: 1.5; margin-bottom: 20px; }
@@ -366,19 +539,16 @@ export default function AACRExplorer() {
         .fav-btn.is-fav { background: rgba(255,217,61,0.12); border-color: rgba(255,217,61,0.3); }
         .close-btn { position: absolute; top: 24px; right: 24px; background: none; border: 1px solid rgba(255,255,255,0.06); color: #3a3e4a; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 4px; cursor: pointer; font-size: 20px; transition: all 0.15s; }
         .close-btn:hover { border-color: #ff6b6b; color: #ff6b6b; }
-
         .tooltip { position: absolute; z-index: 30; background: rgba(10,11,16,0.97); border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(12px); padding: 14px 18px; border-radius: 6px; pointer-events: none; max-width: 460px; animation: tooltipIn 0.12s ease-out; }
         @keyframes tooltipIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
         .tooltip h4 { font-family: 'DM Sans', sans-serif; font-size: 16px; font-weight: 500; color: #d8dae0; margin-bottom: 6px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
         .tooltip p { font-size: 14px; color: #4a4e5a; line-height: 1.4; }
-
-        .legend-panel { position: absolute; bottom: 20px; left: 20px; z-index: 15; background: rgba(8,9,13,0.95); border: 1px solid rgba(255,255,255,0.06); backdrop-filter: blur(12px); padding: 18px 24px; border-radius: 6px; max-height: 600px; overflow-y: auto; animation: tooltipIn 0.2s ease-out; min-width: 380px; }
+        .legend-panel { position: absolute; top: 62px; left: 20px; z-index: 15; background: rgba(8,9,13,0.95); border: 1px solid rgba(255,255,255,0.06); backdrop-filter: blur(12px); padding: 18px 24px; border-radius: 6px; max-height: 600px; overflow-y: auto; animation: tooltipIn 0.2s ease-out; min-width: 380px; }
         .legend-panel h5 { font-size: 12px; color: #2a2e3a; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 14px; }
         .legend-item { display: flex; align-items: center; gap: 10px; font-size: 14px; color: #4a4e5a; margin-bottom: 6px; cursor: pointer; transition: color 0.15s; }
         .legend-item:hover { color: #c8ccd4; }
         .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
         .legend-count { color: #2a2e3a; margin-left: auto; font-size: 12px; }
-
         .table-panel { position: absolute; bottom: 0; left: 0; right: 0; z-index: 25; background: rgba(8,9,13,0.98); border-top: 1px solid rgba(255,255,255,0.06); backdrop-filter: blur(16px); display: flex; flex-direction: column; animation: slideUp 0.2s ease-out; }
         @keyframes slideUp { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
         .table-resize-handle { height: 6px; cursor: ns-resize; background: transparent; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
@@ -398,8 +568,9 @@ export default function AACRExplorer() {
         .table-pager button:hover { border-color: rgba(0,255,159,0.3); color: #00ff9f; }
         .table-pager button:disabled { opacity: 0.3; cursor: default; }
         .table-pager span { font-size: 13px; color: #3a3e4a; }
-
-        .zoom-info { position: absolute; bottom: 20px; right: 20px; z-index: 15; font-size: 12px; color: #1a1e2a; letter-spacing: 2px; user-select: none; }
+        .hints { position: absolute; bottom: 20px; right: 20px; z-index: 15; text-align: right; user-select: none; }
+        .hints p { font-size: 11px; color: #1a1e2a; letter-spacing: 1.5px; line-height: 1.8; }
+        .hints p b { color: #2a3040; }
       `}</style>
 
       {/* Control Bar */}
@@ -419,37 +590,50 @@ export default function AACRExplorer() {
         <button className={`ctrl-btn ${showTable ? "active" : ""}`} onClick={() => { setShowTable(!showTable); setTablePage(0); }}>Table</button>
         <button className="ctrl-btn" onClick={() => exportCSV(false)}>↓ All</button>
         <button className="ctrl-btn" onClick={() => exportCSV(true)}>↓ Favs</button>
+        <button className={`ctrl-btn ${autoRotate ? "active" : ""}`} onClick={() => setAutoRotate((v) => !v)}>↺ Spin</button>
         <button className="ctrl-btn" onClick={handleReset}>Reset</button>
         <span className="stat"><b>{filteredIndices.length}</b> / {abstracts.length}</span>
       </div>
 
       {/* 3D Canvas */}
-      <Canvas
-        camera={{ position: [0, 0, 2], fov: 60, near: 0.01, far: 100 }}
-        style={{ position: "absolute", inset: 0 }}
-        gl={{ antialias: true }}
-      >
-        <color attach="background" args={["#08090d"]} />
-        <PointCloud
-          abstracts={abstracts}
-          embeddings={embeddings}
-          filteredSet={filteredSet}
-          searchSimilarity={searchSimilarity}
-          clusterColors={clusterColors}
-          hoveredId={hoveredId}
-          selectedId={selectedId}
-          onHover={setHoveredId}
-          onSelect={setSelectedId}
-          onTooltipPos={setTooltipData}
-        />
-        <OrbitControls
-          ref={orbitControlsRef}
-          enableDamping
-          dampingFactor={0.05}
-          minDistance={0.3}
-          maxDistance={6}
-        />
-      </Canvas>
+      <div style={{ position: "absolute", inset: 0 }}>
+        <Canvas
+          camera={{ position: [0, 0, 2], fov: 60, near: 0.01, far: 100 }}
+          style={{ width: "100%", height: "100%" }}
+          gl={{ antialias: true }}
+        >
+          <PointCloud
+            abstracts={abstracts}
+            embeddings={embeddings}
+            filteredSet={filteredSet}
+            filteredIndices={filteredIndices}
+            searchSimilarity={searchSimilarity}
+            clusterColors={clusterColors}
+            hoveredId={hoveredId}
+            selectedId={selectedId}
+            onHover={setHoveredId}
+            onSelect={setSelectedId}
+            onTooltipPos={setTooltipData}
+          />
+
+          <OrbitControls
+            ref={orbitControlsRef}
+            enableDamping
+            dampingFactor={0.08}
+            enableZoom={false}
+            minDistance={0.3}
+            maxDistance={6}
+            target={[0, 0, 0]}
+            autoRotate={autoRotate && !spinPaused}
+            autoRotateSpeed={0.5}
+          />
+          <SmoothZoom minDist={0.3} maxDist={6} />
+          <GizmoHelper alignment="bottom-right" margin={[80, 100]}>
+            <GizmoViewport axisColors={["#ff6b6b", "#00ff9f", "#60a5fa"]} labelColor="white" />
+          </GizmoHelper>
+          <SSAO />
+        </Canvas>
+      </div>
 
       {/* Tooltip */}
       {tooltipData && !selected && (
@@ -530,7 +714,12 @@ export default function AACRExplorer() {
       )}
 
       {/* Controls hint */}
-      {!showTable && <div className="zoom-info">DRAG ROTATE · SCROLL ZOOM · RIGHT-DRAG PAN</div>}
+      {!showTable && (
+        <div className="hints">
+          <p>DRAG <b>ROTATE</b> · SCROLL <b>ZOOM</b> · RIGHT-DRAG <b>PAN</b></p>
+          <p>SHIFT + DRAG <b>LOCK HORIZONTAL</b></p>
+        </div>
+      )}
     </div>
   );
 }
