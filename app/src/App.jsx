@@ -516,6 +516,7 @@ export default function AACRExplorer() {
   const [searchTerm, setSearchTerm] = useState("");
   const [topicFilterSelected, setTopicFilterSelected] = useState(() => new Set());
   const [sessionFilterSelected, setSessionFilterSelected] = useState(() => new Set());
+  const [typeFilter, setTypeFilter] = useState(null); // null = all, "poster", "talk"
   const [topicFilterQuery, setTopicFilterQuery] = useState("");
   const [sessionFilterQuery, setSessionFilterQuery] = useState("");
   const [topicDropdownOpen, setTopicDropdownOpen] = useState(false);
@@ -771,10 +772,11 @@ export default function AACRExplorer() {
       if (showFavoritesOnly && !activeListIds.has(a.id)) return false;
       if (topicFilterSelected.size > 0 && !topicFilterSelected.has(a.clusterTopic || "Unknown")) return false;
       if (sessionFilterSelected.size > 0 && !sessionFilterSelected.has(a.session)) return false;
+      if (typeFilter && (a.type || "poster") !== typeFilter) return false;
       if (term && !abstractMatchesSearch(a, term)) return false;
       return true;
     });
-  }, [abstracts, searchTerm, topicFilterSelected, sessionFilterSelected, showFavoritesOnly, activeListIds]);
+  }, [abstracts, searchTerm, topicFilterSelected, sessionFilterSelected, typeFilter, showFavoritesOnly, activeListIds]);
 
   const filteredSet = useMemo(() => new Set(filteredIndices), [filteredIndices]);
 
@@ -792,9 +794,9 @@ export default function AACRExplorer() {
   const exportCSV = (favOnly = false) => {
     const items = favOnly ? abstracts.filter((a) => activeListIds.has(a.id)) : filteredIndices.map((i) => abstracts[i]);
     const escape = (s) => `"${String(s).replace(/"/g, '""')}"`;
-    const header = "ID,Title,Authors,Institution,Session,Start,Topic,Poster Number,Presenter,Abstract";
+    const header = "ID,Type,Title,Authors,Institution,Session,Start,Topic,Poster Number,Presenter,Abstract";
     const rows = items.map((a) =>
-      [a.id, a.title, a.authors.join("; "), a.institution, a.session, a.start || "", a.clusterTopic, a.posterNumber, a.presenter, a.abstract.replace(/\n/g, " ")].map(escape).join(",")
+      [a.id, a.type || "poster", a.title, a.authors.join("; "), a.institution, a.session, a.start || "", a.clusterTopic, a.posterNumber, a.presenter, a.abstract.replace(/\n/g, " ")].map(escape).join(",")
     );
     const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -855,6 +857,7 @@ export default function AACRExplorer() {
         .top-bar-search::placeholder { color: #7d8594; }
         .top-bar-tools { display: flex; align-items: center; gap: 6px; flex-shrink: 0; margin-left: auto; }
         .top-bar-search { flex: 1; min-width: 120px; max-width: 520px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); color: #e4e7ed; font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 7px 12px; border-radius: 4px; outline: none; transition: border-color 0.2s; }
+        .type-filter-wrap { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
         .filter-dropdown-wrap { display: flex; align-items: center; gap: 8px; flex-shrink: 0; position: relative; z-index: 55; }
         .filter-dropdown-panel { position: absolute; top: calc(100% + 8px); left: 0; min-width: 300px; max-width: min(420px, calc(100vw - 24px)); max-height: min(72vh, 520px); z-index: 60; display: flex; flex-direction: column; padding: 10px 12px; background: rgba(32,34,46,0.98); border: 1px solid rgba(255,255,255,0.14); border-radius: 6px; box-shadow: 0 12px 40px rgba(0,0,0,0.35); transform-origin: top left; animation: paneDropIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) both; }
         .filter-dropdown-wrap > div:nth-child(2) .filter-dropdown-panel { left: auto; right: 0; transform-origin: top right; }
@@ -1060,6 +1063,23 @@ export default function AACRExplorer() {
             ) : null}
           </div>
         </div>
+        <div className="type-filter-wrap">
+          <button
+            type="button"
+            className={`ctrl-btn${typeFilter === null ? " active" : ""}`}
+            onClick={() => { setTypeFilter(null); setTablePage(0); }}
+          >All</button>
+          <button
+            type="button"
+            className={`ctrl-btn${typeFilter === "poster" ? " active" : ""}`}
+            onClick={() => { setTypeFilter("poster"); setTablePage(0); }}
+          >Posters</button>
+          <button
+            type="button"
+            className={`ctrl-btn${typeFilter === "talk" ? " active" : ""}`}
+            onClick={() => { setTypeFilter("talk"); setTablePage(0); }}
+          >Talks</button>
+        </div>
         <div className="top-bar-tools">
           <span className="stat"><b>{filteredIndices.length}</b> / {abstracts.length}</span>
           <button type="button" className={`ctrl-btn ${autoRotate ? "active" : ""}`} onClick={() => setAutoRotate((v) => !v)}>Spin</button>
@@ -1123,7 +1143,7 @@ export default function AACRExplorer() {
             {selected ? (
               <div className="sidebar-details-inner detail-panel">
                 <button type="button" className="close-btn" title="Clear selection" onClick={() => setSelectedId(null)}>×</button>
-                <div style={{ fontSize: 10, color: "#8d95a3", letterSpacing: 2, marginBottom: 10 }}>#{selected.id} · POSTER {selected.posterNumber} · {selected.start}</div>
+                <div style={{ fontSize: 10, color: "#8d95a3", letterSpacing: 2, marginBottom: 10 }}>#{selected.id} · {selected.type === "talk" ? "TALK" : `POSTER ${selected.posterNumber}`} · {selected.start}</div>
                 <h2>{selected.title}</h2>
                 <div className="detail-meta"><b>Presenter:</b> {selected.presenter}</div>
                 <AffiliationView institution={selected.institution} authors={selected.authors} />
@@ -1203,7 +1223,7 @@ export default function AACRExplorer() {
               >
                 <h4>{tooltipData.abstract.title}</h4>
                 <p>{tooltipData.abstract.authors.slice(0, 3).join(", ")}{tooltipData.abstract.authors.length > 3 ? " et al." : ""}</p>
-                <p style={{ color: topicColors[tooltipData.abstract.clusterTopic], marginTop: 2 }}>{tooltipData.abstract.clusterTopic} · #{tooltipData.abstract.posterNumber}</p>
+                <p style={{ color: topicColors[tooltipData.abstract.clusterTopic], marginTop: 2 }}>{tooltipData.abstract.clusterTopic} · {tooltipData.abstract.type === "talk" ? "TALK" : `#${tooltipData.abstract.posterNumber}`}</p>
                 {tooltipData.abstract.start && <p style={{ marginTop: 4, color: "#a8b0bc" }}>{tooltipData.abstract.start}</p>}
               </div>
             )}
@@ -1255,7 +1275,7 @@ export default function AACRExplorer() {
                   </div>
                   <div className="table-body">
                     <table>
-                      <thead><tr><th>ID</th><th>Start</th><th>Poster</th><th>Title</th><th>Presenter</th><th>Session</th><th>Topic</th><th>Fav</th></tr></thead>
+                      <thead><tr><th>ID</th><th>Type</th><th>Start</th><th>Poster</th><th>Title</th><th>Presenter</th><th>Session</th><th>Topic</th><th>Fav</th></tr></thead>
                       <tbody>
                         {tablePageAbstracts.flatMap((a, idx) => {
                           const prev = idx === 0 ? prevPageLastAbstract : tablePageAbstracts[idx - 1];
@@ -1266,13 +1286,14 @@ export default function AACRExplorer() {
                           if (showDate) {
                             rows.push(
                               <tr key={`agenda-hdr-${a.internalId}-${idx}`} className="table-agenda-date">
-                                <td colSpan={8}>{formatAgendaDate(parseStartMs(a.start))}</td>
+                                <td colSpan={9}>{formatAgendaDate(parseStartMs(a.start))}</td>
                               </tr>
                             );
                           }
                           rows.push(
                             <tr key={a.id + String(a.internalId)} onClick={() => { const i = abstracts.findIndex((x) => x.id === a.id); setSelectedId(i >= 0 ? i : null); }}>
                               <td style={{ color: "#8d95a3", whiteSpace: "nowrap" }}>{a.id}</td>
+                              <td style={{ whiteSpace: "nowrap", color: a.type === "talk" ? "#48dbfb" : "#a8b0bc", textTransform: "uppercase", fontSize: 10, letterSpacing: 1 }}>{a.type || "poster"}</td>
                               <td style={{ whiteSpace: "nowrap", color: "#b0b8c4" }}>{a.start || "—"}</td>
                               <td style={{ whiteSpace: "nowrap", color: "#a8b0bc" }}>{a.posterNumber || "—"}</td>
                               <td style={{ color: "#e4e7ed", maxWidth: 280 }}>{a.title}</td>
