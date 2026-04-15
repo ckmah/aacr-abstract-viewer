@@ -30,6 +30,17 @@ from umap import UMAP
 DATA_PATH = "app/public/aacr_data.json"
 OUT_PATH = "app/public/aacr_data.json"
 
+SKIPPED_CLUSTER_ID = 99
+SKIPPED_TOPIC_LABEL = "Agenda"
+
+
+def _embedding_text(a: dict) -> str:
+    title = a.get("title", "")
+    body = a.get("abstract", "")
+    text = f"{title}. {body}" if body else title
+    return text[:2000]
+
+
 # ── Step 1: Load and encode ──────────────────────────────────────────────────
 
 print("Loading abstracts...")
@@ -37,18 +48,21 @@ with open(DATA_PATH) as f:
     abstracts = json.load(f)
 print(f"Loaded {len(abstracts)} abstracts")
 
-# Build text: title + abstract only (no tags/topics/keywords)
-texts = []
-for a in abstracts:
-    title = a.get("title", "")
-    body = a.get("abstract", "")
-    text = f"{title}. {body}" if body else title
-    texts.append(text[:2000])
+embed_mask = [a.get("includeInSemanticMap", True) for a in abstracts]
+embed_idx = [i for i, m in enumerate(embed_mask) if m]
+skip_idx = [i for i, m in enumerate(embed_mask) if not m]
+print(f"  Semantic map: {len(embed_idx)} rows; agenda-only (no embed): {len(skip_idx)}")
+
+if not embed_idx:
+    raise SystemExit("No rows with includeInSemanticMap=true; nothing to embed.")
+
+texts_all = [_embedding_text(a) for a in abstracts]
+texts = [texts_all[i] for i in embed_idx]
 
 print("Loading SentenceTransformer model (all-MiniLM-L6-v2)...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-print("Encoding abstracts...")
+print("Encoding abstracts (semantic-map rows only)...")
 embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
 print(f"Embeddings shape: {embeddings.shape}")
 
@@ -83,7 +97,7 @@ tfidf = TfidfVectorizer(
 tfidf_matrix = tfidf.fit_transform(texts)
 feature_names = tfidf.get_feature_names_out()
 
-cluster_topic_labels = {}
+cluster_topic_labels: dict[int, str] = {SKIPPED_CLUSTER_ID: SKIPPED_TOPIC_LABEL}
 for c in range(N_CLUSTERS):
     mask = labels == c
     cluster_tfidf = tfidf_matrix[mask].mean(axis=0).A1
@@ -93,7 +107,7 @@ for c in range(N_CLUSTERS):
     # Pick the single best 1-2 word candidate: highest cosine sim to centroid
     centroid = embeddings[mask].mean(axis=0, keepdims=True)
     # Prefer shorter candidates (1-2 words) that are descriptive
-    short_cands = [c for c in candidates if len(c.split()) <= 2]
+    short_cands = [x for x in candidates if len(x.split()) <= 2]
     if not short_cands:
         short_cands = candidates[:5]
     cand_embs = model.encode(short_cands)
@@ -103,13 +117,22 @@ for c in range(N_CLUSTERS):
     cluster_topic_labels[c] = topic_label
     print(f"  Cluster {c:2d} ({mask.sum():4d} abstracts): {topic_label}")
 
-# Assign each abstract its cluster's topic label
-for i, a in enumerate(abstracts):
-    a["x"] = round(float(coords_norm[i, 0]), 5)
-    a["y"] = round(float(coords_norm[i, 1]), 5)
-    a["z"] = round(float(coords_norm[i, 2]), 5)
-    a["cluster"] = int(labels[i])
-    a["clusterTopic"] = cluster_topic_labels[int(labels[i])]
+# Assign coordinates and cluster labels (agenda-only rows: placeholder coords, no embed)
+for j, i in enumerate(embed_idx):
+    a = abstracts[i]
+    a["x"] = round(float(coords_norm[j, 0]), 5)
+    a["y"] = round(float(coords_norm[j, 1]), 5)
+    a["z"] = round(float(coords_norm[j, 2]), 5)
+    a["cluster"] = int(labels[j])
+    a["clusterTopic"] = cluster_topic_labels[int(labels[j])]
+
+for i in skip_idx:
+    a = abstracts[i]
+    a["x"] = 0.5
+    a["y"] = 0.5
+    a["z"] = 0.5
+    a["cluster"] = SKIPPED_CLUSTER_ID
+    a["clusterTopic"] = SKIPPED_TOPIC_LABEL
 
 # ── Step 4: Write output ─────────────────────────────────────────────────────
 
