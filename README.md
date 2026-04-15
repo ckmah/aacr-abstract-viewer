@@ -1,6 +1,6 @@
 # AACR 2026 Abstract Explorer
 
-An interactive browser for **6,717 poster session abstracts** from the [AACR Annual Meeting 2026](https://www.aacr.org/meeting/aacr-annual-meeting-2026/). Abstracts are embedded into a 2D semantic map so that similar research clusters together visually — you can pan, zoom, search, and explore the landscape of cancer research presented at the meeting.
+An interactive browser for **poster abstracts** (from the AACR online planner, as `aacr_abstracts.json`) plus **invited talks** parsed from the official **Program Guide PDF** — merged into one semantic map for the [AACR Annual Meeting 2026](https://www.aacr.org/meeting/aacr-annual-meeting-2026/). You can pan, zoom, search, and filter **Posters / Talks / All**.
 
 **Live app:** https://ckmah.github.io/aacr-abstract-viewer/
 
@@ -8,54 +8,37 @@ An interactive browser for **6,717 poster session abstracts** from the [AACR Ann
 
 ## Data source
 
-Abstracts were scraped from [abstractsonline.com](https://www.abstractsonline.com) (the official AACR abstract submission and viewing platform) using a Playwright-based browser script (`scrape_aacr.js`) that authenticates with a session cookie and pages through the poster session listing API. The raw data includes title, authors, institution, session, topics, keywords, and full abstract text.
+- **Posters:** Full poster records (title, authors, abstract text, session, poster number, etc.) come from [abstractsonline.com](https://www.abstractsonline.com). Place the export as **`aacr_abstracts.json`** in the repo root (see `merge_aacr_sources.py` for the field names it reads).
+- **Invited talks:** Dates, rooms, session titles, chairs, and invited presentation titles are extracted from the printed **Program Guide PDF** via `scrape_program_guide_pdf.py` (not individual poster rows; those stay online-only per AACR).
 
 ---
 
 ## Embedding pipeline
 
 ```
-Raw abstracts (abstractsonline.com)
-           │
-           ▼
-    scrape_aacr.js
-    ─────────────────────────────────────────────────
-    Playwright browser automation
-    Paginates poster listing API (~6,700 abstracts)
-    Extracts: title, authors, abstract HTML, session,
-              topics, keywords, poster number
-           │
-           ▼
-  precompute_embeddings.py  (uv run)
+Posters: aacr_abstracts.json  (your planner export)
+Talks:   AACR Program Guide PDF --> aacr_program_guide.json (scrape_program_guide_pdf.py)
+           |
+           v merge_aacr_sources.py (uv run)
+    -------------------------------------------------
+    Normalizes fields; posters win on duplicate id.
+    Writes app/public/aacr_data.json (before embeddings)
+           |
+           v
+  precompute_embeddings.py (uv run)
   ─────────────────────────────────────────────────────────────────────
-  │                                                                    │
-  │  Step 1 — Text preparation                                         │
-  │  Concatenate title + abstract text (strip HTML, cap at 2,000 chars)│
-  │                                                                    │
-  │  Step 2 — Sentence encoding                                        │
-  │  SentenceTransformer("all-MiniLM-L6-v2")                           │
-  │  → 384-dimensional dense vector per abstract                       │
-  │                                                                    │
-  │  Step 3 — Dimensionality reduction                                 │
-  │  UMAP(n_components=2, n_neighbors=30, metric="cosine")             │
-  │  → (x, y) coordinates in [0, 1] space                             │
-  │                                                                    │
-  │  Step 4 — Clustering + topic labeling                              │
-  │  KMeans(k=40) on 384-d embeddings                                  │
-  │  TF-IDF on cluster members → top candidate terms                   │
-  │  Cosine similarity of candidate embeddings to cluster centroid     │
-  │  → single best 1–2 word topic label per cluster                    │
+  │  SentenceTransformer(all-MiniLM-L6-v2), UMAP 3D, KMeans + topics │
   └────────────────────────────────────────────────────────────────────
-           │
-           ▼
+           |
+           v
    app/public/aacr_data.json
-   (6,717 abstracts with x, y, cluster, clusterTopic baked in)
-           │
-           ▼
-   React + Canvas app  →  https://ckmah.github.io/aacr-abstract-viewer/
+   (posters + program-guide talks; x, y, z, cluster, clusterTopic)
+           |
+           v
+   React + Canvas app  -->  GitHub Pages build (app/dist)
 ```
 
-Abstracts about similar biology (e.g. CAR-T therapy, KRAS inhibitors, DNA damage response) appear close together on the map. Distant points represent research with little semantic overlap.
+Similar research clusters together on the map; distant points are less semantically related.
 
 ---
 
@@ -66,35 +49,47 @@ Abstracts about similar biology (e.g. CAR-T therapy, KRAS inhibitors, DNA damage
 | **Pan** | Click and drag the canvas |
 | **Zoom** | Scroll wheel — zooms anchored to cursor position |
 | **Hover** | Hover a point to see title, authors, and session in a tooltip |
-| **Select** | Click a point to open the full abstract in the detail panel |
-| **Semantic search** | Type in the search box — points are colored by cosine similarity to your query (bright = most similar) |
-| **Filter by topic** | Use the Topic dropdown to show only abstracts in a given cluster topic |
-| **Filter by session** | Use the Session dropdown to restrict to a specific poster session |
-| **Favorites** | Click the star icon on any abstract to save it |
-| **Export all** | Download all abstracts as `aacr_abstracts_all.csv` |
-| **Export favorites** | Download only starred abstracts as `aacr_abstracts_fav.csv` |
-| **Table browser** | Toggle the bottom panel to browse and sort all abstracts in a table; drag the divider to resize |
-| **Reset view** | Click the Reset button to return to the default zoom and pan |
+| **Select** | Click a point to open the detail panel |
+| **Posters / Talks / All** | Filter by contribution type in the header |
+| **Semantic search** | Search box colors points by similarity to your query |
+| **Filter by topic** | Topic dropdown (cluster label) |
+| **Filter by session** | Session dropdown |
+| **Favorites** | Star an abstract to save it |
+| **Export** | CSV for all filtered rows or favorites |
+| **Table browser** | Bottom panel; resize with the divider |
+| **Reset view** | Reset zoom and pan |
 
 ---
 
 ## Development
 
 ```bash
-# Install dependencies
 cd app && npm install
-
-# Start dev server
-npm run dev
-
-# Build for production
-npm run build
+npm run dev          # dev server
+npm run build        # production bundle (expects app/public/aacr_data.json)
 ```
 
-Deploying to GitHub Pages is automatic on push to `main` via `.github/workflows/deploy.yml`.
-
-To regenerate embeddings after updating the raw data:
+### Build `aacr_data.json`
 
 ```bash
+# 1. Program guide -> aacr_program_guide.json (posters-only: echo '[]' > aacr_program_guide.json)
+uv run scrape_program_guide_pdf.py
+
+# 2. Merge posters + talks, then embed
+uv run merge_aacr_sources.py
 uv run precompute_embeddings.py
 ```
+
+`merge_aacr_sources.py` defaults: `--posters aacr_abstracts.json`, `--talks aacr_program_guide.json`, `--out app/public/aacr_data.json`.
+
+Deploying to GitHub Pages runs `npm run build` in `app/` via `.github/workflows/deploy.yml`. Commit `app/public/aacr_data.json` if the site should ship with data (file is large).
+
+---
+
+## Scripts (this repo)
+
+| Script | Role |
+|--------|------|
+| `scrape_program_guide_pdf.py` | PDF → `aacr_program_guide.json` |
+| `merge_aacr_sources.py` | `aacr_abstracts.json` + program guide → `app/public/aacr_data.json` |
+| `precompute_embeddings.py` | Adds coordinates and cluster topics to `app/public/aacr_data.json` |

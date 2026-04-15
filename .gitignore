@@ -3,7 +3,12 @@ app/node_modules/
 dist/
 app/dist/
 *.local
+.playwright-mcp/
 
 # Raw scrape data (not needed by app)
 aacr_abstracts.json
+aacr_program_guide.json
 app/public/aacr_abstracts.json
+
+# Large local reference (not in repo)
+AACR2026_Program_Guide.pdf

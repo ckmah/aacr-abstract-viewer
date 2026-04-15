@@ -1,23 +1,22 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { Canvas, useThree, useFrame, extend } from "@react-three/fiber";
-import { OrbitControls, GizmoHelper, GizmoViewport, shaderMaterial } from "@react-three/drei";
+import { OrbitControls, GizmoHelper, GizmoViewport, shaderMaterial, Billboard } from "@react-three/drei";
 import * as THREE from "three";
 
 const PICK_RADIUS_PX = 30;
 const ZOOM_STOP_COUNT = 22;
 
-/* ── Color palette (40 clusters) — vibrant, dark-theme optimized ── */
+/* ── Tableau 40 (topic / cluster colors) ── */
 const PALETTE = [
-  "#ff4757", "#ff6b81", "#ff7f50", "#ff9f43",
-  "#ffd32a", "#ffdd59", "#7bed9f", "#adff2f",
-  "#2ed573", "#1dd1a1", "#00d2d3", "#48dbfb",
-  "#54a0ff", "#1e90ff", "#5352ed", "#3742fa",
-  "#a29bfe", "#6c5ce7", "#8854d0", "#be2edd",
-  "#e84393", "#fd79a8", "#f368e0", "#ff9ff3",
-  "#e17055", "#fdcb6e", "#f9ca24", "#badc58",
-  "#26de81", "#01abc7", "#0652dd", "#00b894",
-  "#ff6348", "#eccc68", "#45aaf2", "#ff4081",
-  "#2bcbba", "#ee5a24", "#f8b739", "#778beb",
+  "#03579b", "#0488d1", "#03a9f4", "#4fc3f7", "#b3e5fc",
+  "#253137", "#455a64", "#607d8b", "#90a4ae", "#cfd8dc",
+  "#19237e", "#303f9f", "#3f51b5", "#7986cb", "#c5cae9",
+  "#4a198c", "#7b21a2", "#9c27b0", "#ba68c8", "#e1bee7",
+  "#88144f", "#c21f5b", "#e92663", "#f06292", "#f8bbd0",
+  "#bf360c", "#e64a18", "#ff5722", "#ff8a65", "#ffccbc",
+  "#f67f17", "#fbc02c", "#ffec3a", "#fff177", "#fdf9c3",
+  "#33691d", "#689f38", "#8bc34a", "#aed581", "#ddedc8",
 ];
 
 const FAVORITE_IDS_KEY = "aacr-favorite-ids";
@@ -27,15 +26,681 @@ const FAVORITE_POINT_COLOR = "#ffd93d";
 const ZOOM_MIN = 0.55;
 const ZOOM_MAX = 2;
 
+const scatterOrbitActiveRef = { current: false };
+const scatterZoomActiveRef = { current: false };
+/** After an orbit drag, browser still fires click; skip one scatter select. */
+const scatterSuppressNextClickRef = { current: false };
+const scatterOrbitPointerDownRef = { current: null };
+const scatterOrbitDragExceededRef = { current: false };
+const SCATTER_ORBIT_DRAG_THRESHOLD_PX = 5;
+
+function scatterPickBlocked() {
+  return scatterOrbitActiveRef.current || scatterZoomActiveRef.current;
+}
+
 function parseStartMs(s) {
   if (!s || typeof s !== "string") return 0;
-  const t = Date.parse(s);
+  let normalized = s.trim();
+  const isoDateTime = /^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}:\d{2}(?::\d{2})?)/;
+  const m = isoDateTime.exec(normalized);
+  if (m && !normalized.includes("T")) normalized = `${m[1]}T${m[2]}`;
+  const t = Date.parse(normalized);
   return Number.isNaN(t) ? 0 : t;
+}
+
+function formatAbstractTime(ms) {
+  if (!ms) return "—";
+  return new Date(ms).toLocaleString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatAbstractTimeLabel(s) {
+  const ms = parseStartMs(s);
+  if (ms) return formatAbstractTime(ms);
+  const t = s && String(s).trim();
+  return t || "—";
 }
 
 function formatAgendaDate(ms) {
   if (!ms) return "Unknown date";
   return new Date(ms).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+
+function rowTimeMs(a) {
+  return parseStartMs(a.start);
+}
+
+function timeDomainFromRows(rows) {
+  let minT = Infinity;
+  let maxT = -Infinity;
+  for (const a of rows) {
+    const t = rowTimeMs(a);
+    if (t > 0) {
+      minT = Math.min(minT, t);
+      maxT = Math.max(maxT, t);
+    }
+  }
+  if (!isFinite(minT) || minT >= maxT) return null;
+  return { min: minT, max: maxT };
+}
+
+const MS = 1;
+const SEC = 1000;
+const MIN = 60 * SEC;
+const HOUR = 60 * MIN;
+const DAY = 24 * HOUR;
+
+function pickNiceTickStep(spanMs, maxTicks = 6) {
+  const ideal = spanMs / Math.max(2, maxTicks);
+  const steps = [
+    500 * MS, SEC, 2 * SEC, 5 * SEC, 10 * SEC, 15 * SEC, 30 * SEC,
+    MIN, 2 * MIN, 5 * MIN, 10 * MIN, 15 * MIN, 30 * MIN,
+    HOUR, 2 * HOUR, 3 * HOUR, 4 * HOUR, 6 * HOUR, 12 * HOUR,
+    DAY, 2 * DAY, 7 * DAY, 14 * DAY, 30 * DAY, 90 * DAY, 365 * DAY,
+  ];
+  for (let i = 0; i < steps.length; i++) {
+    if (steps[i] >= ideal) return steps[i];
+  }
+  return steps[steps.length - 1];
+}
+
+function formatTimelineInstant(ms, spanMs) {
+  const d = new Date(ms);
+  if (spanMs > 180 * DAY) {
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
+  if (spanMs > 14 * DAY) {
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+  if (spanMs > 2 * DAY) {
+    return d.toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+  if (spanMs > 6 * HOUR) {
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+  if (spanMs > 45 * MIN) {
+    return d.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  }
+  if (spanMs > 5 * MIN) {
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  if (spanMs > 45 * SEC) {
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 3 });
+}
+
+function formatTimelineTickInterior(ms, spanMs) {
+  const d = new Date(ms);
+  if (spanMs > 21 * DAY) {
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+  if (spanMs > 2 * DAY) {
+    return d.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  }
+  if (spanMs > 6 * HOUR) {
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+  if (spanMs > 5 * MIN) {
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", fractionalSecondDigits: 2 });
+}
+
+function buildTimelineTicks(v0, v1, domainMin, domainMax, maxTicks = 6) {
+  const span = v1 - v0;
+  if (!Number.isFinite(span) || span <= 0) return [];
+  const step = pickNiceTickStep(span, maxTicks + 1);
+  const start = Math.ceil(v0 / step) * step;
+  const ticks = [];
+  const eps = step * 1e-7;
+  for (let ms = start; ms <= v1 + eps; ms += step) {
+    if (ms + eps < v0) continue;
+    if (ms - eps > v1) break;
+    const clamped = Math.min(Math.max(ms, domainMin), domainMax);
+    const frac = (clamped - v0) / span;
+    if (frac < 0.04 || frac > 0.96) continue;
+    ticks.push({ ms: clamped, frac, key: `tl-${Math.round(clamped)}` });
+    if (ticks.length >= maxTicks) break;
+  }
+  return ticks;
+}
+
+function collectEightAmMsInRange(v0, v1) {
+  const out = [];
+  const cur = new Date(v0);
+  cur.setMilliseconds(0);
+  cur.setSeconds(0);
+  cur.setMinutes(0);
+  cur.setHours(8);
+  if (cur.getTime() < v0) cur.setDate(cur.getDate() + 1);
+  while (cur.getTime() <= v1) {
+    out.push(cur.getTime());
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
+}
+
+function buildTimelineTicksAt8am(v0, v1, domainMin, domainMax, maxTicks = 6) {
+  const span = v1 - v0;
+  if (!Number.isFinite(span) || span <= 0) return [];
+  let raw = collectEightAmMsInRange(v0, v1);
+  if (raw.length > maxTicks) raw = thinSortedTimes(raw, maxTicks);
+  const ticks = [];
+  for (const ms of raw) {
+    const clamped = Math.min(Math.max(ms, domainMin), domainMax);
+    const frac = (clamped - v0) / span;
+    if (frac < 0.04 || frac > 0.96) continue;
+    ticks.push({ ms: clamped, frac, key: `tl8-${Math.round(clamped)}` });
+    if (ticks.length >= maxTicks) break;
+  }
+  return ticks;
+}
+
+function buildMainTimelineTicks(v0, v1, domainMin, domainMax, maxTicks = 6) {
+  let t = buildTimelineTicksAt8am(v0, v1, domainMin, domainMax, maxTicks);
+  if (t.length === 0) t = buildTimelineTicks(v0, v1, domainMin, domainMax, maxTicks);
+  return t;
+}
+
+function classifyTimelineMarkKind(ms) {
+  const s = Math.round(ms / 1000) * 1000;
+  const d = new Date(s);
+  if (d.getHours() === 8 && d.getMinutes() === 0 && d.getSeconds() === 0) return "day";
+  if (d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0) return "day";
+  if (d.getMinutes() === 0 && d.getSeconds() === 0) return "hour";
+  return "sub";
+}
+
+function buildTimelineVerticalMarks(v0, v1, domainMin, domainMax) {
+  const interior = buildMainTimelineTicks(v0, v1, domainMin, domainMax, 6);
+  const rows = [
+    { frac: 0, key: "mark-v0", ms: v0 },
+    ...interior.map((t) => ({ frac: t.frac, key: `mark-${t.key}`, ms: t.ms })),
+    { frac: 1, key: "mark-v1", ms: v1 },
+  ];
+  return rows.map((r) => ({ ...r, kind: classifyTimelineMarkKind(r.ms) }));
+}
+
+function binSegmentInView(binStart, binEnd, v0, v1) {
+  const lo = Math.max(v0, binStart);
+  const hi = Math.min(v1, binEnd);
+  if (hi <= lo) return null;
+  const span = v1 - v0;
+  return { left: (lo - v0) / span, width: (hi - lo) / span };
+}
+
+function buildHourlyHeatmapStats(abstracts, domain) {
+  if (!domain || !abstracts?.length) return null;
+  const { min, max } = domain;
+  const bin0 = Math.floor(min / HOUR) * HOUR;
+  const numBins = Math.max(1, Math.ceil((max - bin0) / HOUR));
+  const counts = new Array(numBins).fill(0);
+  for (const a of abstracts) {
+    const t = rowTimeMs(a);
+    if (!t || t < min || t > max) continue;
+    const i = Math.min(numBins - 1, Math.max(0, Math.floor((t - bin0) / HOUR)));
+    counts[i]++;
+  }
+  const maxCount = Math.max(1, ...counts);
+  const bins = counts.map((count, i) => ({
+    start: bin0 + i * HOUR,
+    end: bin0 + (i + 1) * HOUR,
+    count,
+  }));
+  return { bins, maxCount };
+}
+
+function thinSortedTimes(sorted, max) {
+  if (sorted.length <= max) return sorted;
+  const out = [];
+  const n = sorted.length;
+  const step = (n - 1) / (max - 1);
+  for (let k = 0; k < max; k++) out.push(sorted[Math.round(k * step)]);
+  return [...new Set(out)].sort((a, b) => a - b);
+}
+
+function uniqueSortedMarkerTimes(rows, max = 1200) {
+  const s = new Set();
+  for (const a of rows) {
+    const t = rowTimeMs(a);
+    if (t > 0) s.add(t);
+  }
+  const arr = [...s].sort((a, b) => a - b);
+  return thinSortedTimes(arr, max);
+}
+
+const TL_MIN_ZOOM_WINDOW_MS = 3 * HOUR;
+
+function formatDurationShort(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0";
+  if (ms >= DAY) return `${(ms / DAY).toFixed(ms >= 10 * DAY ? 0 : 1)}d`;
+  if (ms >= HOUR) return `${Math.round(ms / HOUR)}h`;
+  if (ms >= MIN) return `${Math.round(ms / MIN)}m`;
+  return `${Math.round(ms / SEC)}s`;
+}
+
+function TableTimeFilterBar({
+  domain,
+  viewMin,
+  viewMax,
+  filterMin,
+  filterMax,
+  onViewChange,
+  onFilterChange,
+  onClearFilter,
+  heatmapStats,
+  occurrenceMarkerTimes,
+  selectedTimeMs,
+}) {
+  const trackRef = useRef(null);
+  const timelineMapRef = useRef(null);
+  const drag = useRef(null);
+  const [hoverHint, setHoverHint] = useState(null);
+  const [rangePreview, setRangePreview] = useState(null);
+
+  const v0 = viewMin;
+  const v1 = viewMax;
+  const domainSpan = domain.max - domain.min;
+  const minZoomSpan = Math.min(TL_MIN_ZOOM_WINDOW_MS, Math.max(domainSpan, MIN));
+  const viewSpan = Math.max(v1 - v0, minZoomSpan);
+
+  const msToFrac = (ms) => (ms - v0) / viewSpan;
+
+  const clampPairToView = (a, b) => {
+    let lo = Math.min(a, b);
+    let hi = Math.max(a, b);
+    lo = Math.max(lo, v0);
+    hi = Math.min(hi, v1);
+    if (hi - lo < 60000) hi = lo + 60000;
+    if (hi > v1) {
+      hi = v1;
+      lo = Math.max(v0, hi - 60000);
+    }
+    return { min: lo, max: hi };
+  };
+
+  const clientXToMs = (clientX) => {
+    const el = timelineMapRef.current || trackRef.current;
+    if (!el) return v0;
+    const rect = el.getBoundingClientRect();
+    const mx = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    return v0 + mx * viewSpan;
+  };
+
+  const trackCursorStyle = (clientX) => {
+    if (!timelineMapRef.current && !trackRef.current) return "crosshair";
+    const ms = clientXToMs(clientX);
+    const fl = msToFrac(filterMin);
+    const fr = msToFrac(filterMax);
+    const brushFracW = Math.max(fr - fl, 0);
+    const atFullDomain =
+      filterMin <= domain.min + 1000 && filterMax >= domain.max - 1000;
+    const canMoveBrush =
+      !atFullDomain && brushFracW < 0.94 && brushFracW > 0.012;
+    const inBrush = canMoveBrush && ms >= filterMin && ms <= filterMax;
+    if (inBrush) return "grab";
+    return "crosshair";
+  };
+
+  const onPointerMove = (e) => {
+    const d = drag.current;
+    if (d && trackRef.current) {
+      const c =
+        d.mode === "move" || d.mode === "pan" ? "grabbing" : "crosshair";
+      trackRef.current.style.cursor = c;
+    }
+    if (!d || !trackRef.current) return;
+    const rect = trackRef.current.getBoundingClientRect();
+    const w = rect.width;
+    const totalDx = e.clientX - d.pointerDownX;
+    const dMs = (totalDx / w) * (d.initialV1 - d.initialV0);
+
+    if (d.mode === "pan") {
+      const span = d.initialV1 - d.initialV0;
+      let n0 = d.initialV0 - dMs;
+      let n1 = d.initialV1 - dMs;
+      if (n0 < d.domain.min) {
+        n0 = d.domain.min;
+        n1 = n0 + span;
+      }
+      if (n1 > d.domain.max) {
+        n1 = d.domain.max;
+        n0 = n1 - span;
+      }
+      onViewChange({ min: n0, max: n1 });
+      return;
+    }
+    if (d.mode === "move") {
+      const span = d.initialF1 - d.initialF0;
+      let a = d.initialF0 + dMs;
+      let b = a + span;
+      if (a < v0) {
+        a = v0;
+        b = a + span;
+      }
+      if (b > v1) {
+        b = v1;
+        a = b - span;
+      }
+      onFilterChange({ min: a, max: b }, { reason: "move" });
+      return;
+    }
+    if (d.mode === "selectRange") {
+      const cur = clientXToMs(e.clientX);
+      const next = clampPairToView(d.anchorMs, cur);
+      d.preview = next;
+      setRangePreview(next);
+      setHoverHint({
+        x: e.clientX,
+        y: e.clientY,
+        text: formatTimelineInstant(cur, viewSpan),
+      });
+    }
+  };
+
+  const onPointerUp = (e) => {
+    const d = drag.current;
+    const el = trackRef.current;
+    if (el && e.pointerId != null) {
+      try {
+        el.releasePointerCapture(e.pointerId);
+      } catch { /* ignore */ }
+    }
+    if (d?.mode === "selectRange" && d.preview) {
+      onFilterChange(d.preview, { reason: "selectCommit" });
+    }
+    drag.current = null;
+    setRangePreview(null);
+    setHoverHint(null);
+    if (trackRef.current) trackRef.current.style.cursor = "";
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("pointerup", onPointerUp);
+    window.removeEventListener("pointercancel", onPointerUp);
+  };
+
+  const onPointerDown = (e) => {
+    if (!trackRef.current || e.button !== 0) return;
+    const el = trackRef.current;
+    const ms = clientXToMs(e.clientX);
+    const fl = msToFrac(filterMin);
+    const fr = msToFrac(filterMax);
+    const brushFracW = Math.max(fr - fl, 0);
+    const atFullDomain =
+      filterMin <= domain.min + 1000 && filterMax >= domain.max - 1000;
+    const canMoveBrush =
+      !atFullDomain && brushFracW < 0.94 && brushFracW > 0.012;
+    const inBrush = canMoveBrush && ms >= filterMin && ms <= filterMax;
+
+    setHoverHint(null);
+    if (e.shiftKey) {
+      el.style.cursor = "grabbing";
+      drag.current = {
+        mode: "pan",
+        pointerDownX: e.clientX,
+        initialV0: v0,
+        initialV1: v1,
+        initialF0: filterMin,
+        initialF1: filterMax,
+        domain,
+      };
+    } else if (inBrush) {
+      el.style.cursor = "grabbing";
+      drag.current = {
+        mode: "move",
+        pointerDownX: e.clientX,
+        initialV0: v0,
+        initialV1: v1,
+        initialF0: filterMin,
+        initialF1: filterMax,
+        domain,
+      };
+    } else {
+      el.style.cursor = "crosshair";
+      const seed = clampPairToView(ms, ms);
+      setRangePreview(seed);
+      drag.current = {
+        mode: "selectRange",
+        pointerDownX: e.clientX,
+        anchorMs: ms,
+        preview: seed,
+        initialV0: v0,
+        initialV1: v1,
+        initialF0: filterMin,
+        initialF1: filterMax,
+        domain,
+      };
+    }
+    try {
+      el.setPointerCapture(e.pointerId);
+    } catch { /* ignore */ }
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+  };
+
+  const onTimelineMapPointerMove = (e) => {
+    if (drag.current) return;
+    const ms = clientXToMs(e.clientX);
+    setHoverHint({
+      x: e.clientX,
+      y: e.clientY,
+      text: formatTimelineInstant(ms, viewSpan),
+    });
+    if (trackRef.current) trackRef.current.style.cursor = trackCursorStyle(e.clientX);
+  };
+
+  const onTimelineMapPointerLeave = () => {
+    if (!drag.current) {
+      setHoverHint(null);
+      if (trackRef.current) trackRef.current.style.cursor = "";
+    }
+  };
+
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!domain || !el) return;
+    const handler = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = el.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) / rect.width;
+      const cursorMs = v0 + Math.min(1, Math.max(0, mx)) * viewSpan;
+      const span = viewSpan;
+      const factor = e.deltaY > 0 ? 1.12 : 1 / 1.12;
+      let newSpan = Math.max(minZoomSpan, span * factor);
+      newSpan = Math.min(newSpan, domain.max - domain.min);
+      let n0 = cursorMs - mx * newSpan;
+      let n1 = n0 + newSpan;
+      if (n0 < domain.min) {
+        n0 = domain.min;
+        n1 = n0 + newSpan;
+      }
+      if (n1 > domain.max) {
+        n1 = domain.max;
+        n0 = n1 - newSpan;
+      }
+      onViewChange({ min: n0, max: n1 });
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => el.removeEventListener("wheel", handler);
+  }, [domain, v0, v1, viewSpan, minZoomSpan, onViewChange]);
+
+  if (!domain) return null;
+
+  const fullSpan = domain.max - domain.min;
+  const zoomPct = fullSpan > 0 ? Math.round((viewSpan / fullSpan) * 1000) / 10 : 100;
+
+  const dispMin = rangePreview ? rangePreview.min : filterMin;
+  const dispMax = rangePreview ? rangePreview.max : filterMax;
+  const fl = Math.min(1, Math.max(0, msToFrac(dispMin)));
+  const fr = Math.min(1, Math.max(0, msToFrac(dispMax)));
+  const fw = Math.max(fr - fl, 0.012);
+  const atFullDomain =
+    filterMin <= domain.min + 1000 && filterMax >= domain.max - 1000;
+
+  return (
+    <div className="table-time-filter">
+      <div className="table-time-filter-label">
+        <span>Time range</span>
+        {!atFullDomain ? (
+          <button type="button" className="ctrl-btn table-time-clear" onClick={onClearFilter}>
+            Reset range
+          </button>
+        ) : null}
+      </div>
+      <div className="table-time-filter-axis">
+        <div className="table-time-zoom-legend" title="Viewport width vs full agenda span">
+          <span>{zoomPct}% of agenda</span>
+          <span className="table-time-zoom-legend-sub">{formatDurationShort(viewSpan)} window</span>
+        </div>
+        <div className="table-time-filter-vrules" aria-hidden>
+          {buildTimelineVerticalMarks(v0, v1, domain.min, domain.max).map((m) => (
+            <div
+              key={m.key}
+              className={`table-time-filter-vrule table-time-filter-vrule--${m.kind}`}
+              style={{ left: `${m.frac * 100}%` }}
+            />
+          ))}
+        </div>
+        <div
+          className="table-time-filter-map-surface"
+          ref={timelineMapRef}
+          onPointerMove={onTimelineMapPointerMove}
+          onPointerLeave={onTimelineMapPointerLeave}
+        >
+        <div
+          className="table-time-filter-tickstrip"
+          aria-hidden
+        >
+          {buildMainTimelineTicks(v0, v1, domain.min, domain.max, 6).map((t) => (
+            <span
+              key={t.key}
+              className="table-time-filter-tick"
+              style={{ left: `${t.frac * 100}%` }}
+              title={formatTimelineInstant(t.ms, viewSpan)}
+            >
+              {formatTimelineTickInterior(t.ms, viewSpan)}
+            </span>
+          ))}
+        </div>
+        <div
+          className="table-time-filter-track"
+          ref={trackRef}
+          onPointerDown={onPointerDown}
+          role="slider"
+          aria-label="Time range filter and zoom"
+        >
+          {heatmapStats ? (
+            <div className="table-time-filter-heatmap-wrap" aria-hidden>
+              {heatmapStats.bins.map((bin) => {
+                const seg = binSegmentInView(bin.start, bin.end, v0, v1);
+                if (!seg) return null;
+                const intensity = bin.count / heatmapStats.maxCount;
+                return (
+                  <div
+                    key={`heat-${bin.start}`}
+                    className="table-time-filter-heatcell"
+                    style={{
+                      left: `${seg.left * 100}%`,
+                      width: `${seg.width * 100}%`,
+                      background: `hsla(205, 72%, ${22 + 42 * intensity}%, ${0.28 + 0.52 * intensity})`,
+                    }}
+                    title={`${bin.count} in this hour`}
+                  />
+                );
+              })}
+            </div>
+          ) : null}
+          <div className="table-time-filter-occ-layer" aria-hidden>
+            {(occurrenceMarkerTimes ?? []).map((ms, i) => {
+              const frac = (ms - v0) / viewSpan;
+              if (frac < -0.002 || frac > 1.002) return null;
+              const isSel = selectedTimeMs != null && Math.abs(ms - selectedTimeMs) < 45000;
+              if (isSel) return null;
+              return (
+                <div
+                  key={`occ-flt-${ms}-${i}`}
+                  className="table-time-filter-occ"
+                  style={{ left: `${Math.min(1, Math.max(0, frac)) * 100}%` }}
+                />
+              );
+            })}
+            {selectedTimeMs != null && (() => {
+              const frac = (selectedTimeMs - v0) / viewSpan;
+              if (frac < -0.002 || frac > 1.002) return null;
+              return (
+                <div
+                  className="table-time-filter-occ table-time-filter-occ--selected"
+                  style={{ left: `${Math.min(1, Math.max(0, frac)) * 100}%` }}
+                />
+              );
+            })()}
+          </div>
+          <div
+            className={`table-time-filter-brush${rangePreview ? " table-time-filter-brush--preview" : ""}`}
+            style={{ left: `${fl * 100}%`, width: `${fw * 100}%` }}
+          />
+        </div>
+      <div className="table-time-filter-ticks">
+        <span className="table-time-edge">{formatTimelineInstant(v0, viewSpan)}</span>
+        <span className="table-time-filter-hint">Wheel zoom · Shift+drag pan · drag to set range · drag band to move</span>
+        <span className="table-time-edge">{formatTimelineInstant(v1, viewSpan)}</span>
+      </div>
+        </div>
+      </div>
+      {typeof document !== "undefined" && hoverHint
+        ? createPortal(
+            <div
+              className="table-time-cursor-hint"
+              style={{
+                position: "fixed",
+                left: hoverHint.x + 8,
+                top: hoverHint.y + 8,
+                zIndex: 10050,
+              }}
+            >
+              {hoverHint.text}
+            </div>,
+            document.body,
+          )
+        : null}
+    </div>
+  );
+}
+
+function compareTableRows(a, b, key, dir, favoriteIdSet) {
+  const m = dir === "asc" ? 1 : -1;
+  const lc = (x) => String(x ?? "").toLowerCase();
+  switch (key) {
+    case "id":
+      return m * lc(a.id).localeCompare(lc(b.id));
+    case "type":
+      return m * lc(a.type || "poster").localeCompare(lc(b.type || "poster"));
+    case "time":
+      return m * (rowTimeMs(a) - rowTimeMs(b));
+    case "poster":
+      return m * lc(a.posterNumber).localeCompare(lc(b.posterNumber));
+    case "title":
+      return m * lc(a.title).localeCompare(lc(b.title));
+    case "presenter":
+      return m * lc(unifiedPeopleText(a.authors, a.presenter)).localeCompare(
+        lc(unifiedPeopleText(b.authors, b.presenter)),
+      );
+    case "session":
+      return m * lc(a.session).localeCompare(lc(b.session));
+    case "topic":
+      return m * lc(a.clusterTopic).localeCompare(lc(b.clusterTopic));
+    case "fav":
+      return m * ((favoriteIdSet.has(a.id) ? 1 : 0) - (favoriteIdSet.has(b.id) ? 1 : 0));
+    default:
+      return 0;
+  }
 }
 
 function loadFavoriteIds() {
@@ -108,14 +773,44 @@ function parseInstitutionBlock(raw) {
   return { authorParts, affiliationLines };
 }
 
-function AffiliationView({ institution, authors }) {
+function normalizePersonKey(s) {
+  return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/** Posters use `authors`, talks use `presenter` for the same role; merge without duplicates. */
+function unifiedPeopleList(authors, presenter) {
+  const seen = new Set();
+  const out = [];
+  const add = (raw) => {
+    const t = String(raw || "").trim();
+    if (!t) return;
+    const k = normalizePersonKey(t);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(t);
+  };
+  for (const a of authors || []) add(a);
+  add(presenter);
+  return out;
+}
+
+function unifiedPeopleText(authors, presenter) {
+  const list = unifiedPeopleList(authors, presenter);
+  return list.length ? list.join(", ") : "—";
+}
+
+function AffiliationView({ institution, authors, presenter }) {
+  const presenterTrim = (presenter || "").trim();
   const { authorParts, affiliationLines } = parseInstitutionBlock(institution);
   const hasParsedAffil = affiliationLines.length > 0;
   const hasAuthorSup = authorParts.some((p) => p.sup);
+  const presenterDupInParts =
+    presenterTrim &&
+    authorParts.some((p) => normalizePersonKey(p.text) === normalizePersonKey(presenterTrim));
   if (!hasParsedAffil && !hasAuthorSup) {
     return (
       <>
-        <div className="detail-meta"><b>Authors:</b> {(authors || []).join(", ")}</div>
+        <div className="detail-meta"><b>Authors</b> {unifiedPeopleText(authors, presenter)}</div>
         {institution ? <div className="detail-meta"><b>Institution:</b> {institution}</div> : null}
       </>
     );
@@ -123,7 +818,8 @@ function AffiliationView({ institution, authors }) {
   return (
     <>
       <div className="detail-meta">
-        <b>Authors:</b>{" "}
+        <b>Authors</b>{" "}
+        {presenterTrim && !presenterDupInParts ? <span>{presenterTrim}. </span> : null}
         {authorParts.map((p, i) => (
           <span key={i}>
             {i > 0 ? ", " : ""}
@@ -158,14 +854,17 @@ function topicLabelColor(topic) {
   return PALETTE[Math.abs(h) % PALETTE.length];
 }
 
+function isSemanticMapPoint(a) {
+  return a && a.includeInSemanticMap !== false;
+}
+
 function abstractMatchesSearch(a, term) {
   if (!term) return true;
   const t = term.toLowerCase();
   const parts = [
     a.title,
-    (a.authors || []).join(" "),
+    unifiedPeopleList(a.authors, a.presenter).join(" "),
     String(a.id),
-    a.presenter || "",
     a.clusterTopic || "",
     a.session || "",
     a.institution || "",
@@ -190,14 +889,21 @@ function similarityColor(sim) {
 }
 
 const POINT_SPRITE_VERT = `
+  attribute float aIndex;
   varying vec3 vColor;
   varying float vDistance;
+  varying float vSel;
   uniform float uRadius;
+  uniform float uSelIndex;
 
   void main() {
     vColor = color;
+    float isS = (uSelIndex >= 0.0 && abs(aIndex - uSelIndex) < 0.5) ? 1.0 : 0.0;
+    vSel = isS;
+
     float distanceFactor = pow(max(0.0, uRadius - distance(position, vec3(0.0))), 1.5);
-    float size = distanceFactor * 10.0 + 10.0;
+    float size = distanceFactor * 3.2 + 3.8;
+    size *= 1.0 + 0.22 * vSel;
     vDistance = distanceFactor;
 
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
@@ -205,25 +911,30 @@ const POINT_SPRITE_VERT = `
 
     gl_PointSize = size;
     gl_PointSize *= (1.0 / max(-mvPosition.z, 1e-4));
+    gl_PointSize = clamp(gl_PointSize, 2.0, 72.0);
   }
 `;
 
 const POINT_SPRITE_FRAG = `
   varying vec3 vColor;
   varying float vDistance;
+  varying float vSel;
   uniform vec3 uWarmTint;
   uniform float uIntensity;
 
   void main() {
-    vec3 color = vColor;
     float r = distance(gl_PointCoord, vec2(0.5)) * 2.0;
-    float strength = pow(max(1.0 - smoothstep(0.48, 1.0, r), 0.0), 1.18);
 
+    float strength = pow(max(1.0 - smoothstep(0.48, 1.0, r), 0.0), 1.25);
+    vec3 color = vColor;
     float warmAmt = clamp(vDistance * 0.042, 0.0, 0.11);
     color = mix(color, uWarmTint, warmAmt);
-    color *= uIntensity;
-    // Additive (SrcAlpha, One): one falloff via rgb; alpha 1 avoids strength^2 blowout
-    gl_FragColor = vec4(color * strength, 1.0);
+    float selBoost = vSel;
+    color *= uIntensity * (1.0 + 0.28 * selBoost);
+    float alpha = strength * 0.52 * (1.0 + 0.14 * selBoost);
+    if (alpha < 0.018) discard;
+    color = min(color * strength, vec3(1.25));
+    gl_FragColor = vec4(color, alpha);
   }
 `;
 
@@ -231,19 +942,59 @@ const PointSpriteMaterial = shaderMaterial(
   {
     uRadius: 1.5,
     uWarmTint: new THREE.Vector3(0.88, 0.78, 0.72),
-    uIntensity: 0.62,
+    uIntensity: 0.88,
+    uSelIndex: -1,
   },
   POINT_SPRITE_VERT,
   POINT_SPRITE_FRAG,
   (m) => {
     m.glslVersion = THREE.GLSL1;
     m.transparent = true;
+    m.depthTest = true;
     m.depthWrite = false;
-    m.blending = THREE.AdditiveBlending;
+    m.blending = THREE.NormalBlending;
     m.vertexColors = true;
   },
 );
 extend({ PointSpriteMaterial });
+
+function SelectionRing({ position }) {
+  const groupRef = useRef(null);
+  useFrame(({ clock }) => {
+    const g = groupRef.current;
+    if (!g) return;
+    const s = 1 + 0.1 * Math.sin(clock.elapsedTime * 2.75);
+    g.scale.setScalar(s);
+  });
+  return (
+    <Billboard follow position={position}>
+      <group ref={groupRef}>
+        <mesh renderOrder={1000} frustumCulled={false}>
+          <ringGeometry args={[0.0066, 0.0104, 48]} />
+          <meshBasicMaterial
+            color="#ffffff"
+            transparent
+            opacity={0.2}
+            side={THREE.DoubleSide}
+            depthTest
+            depthWrite={false}
+          />
+        </mesh>
+        <mesh renderOrder={1001} frustumCulled={false}>
+          <ringGeometry args={[0.0048, 0.0078, 48]} />
+          <meshBasicMaterial
+            color="#ffffff"
+            transparent
+            opacity={0.55}
+            side={THREE.DoubleSide}
+            depthTest
+            depthWrite={false}
+          />
+        </mesh>
+      </group>
+    </Billboard>
+  );
+}
 
 function pickNearestScreenIndex(clientX, clientY, rect, camera, positions, indices, v) {
   const px = clientX - rect.left;
@@ -269,16 +1020,14 @@ function pickNearestScreenIndex(clientX, clientY, rect, camera, positions, indic
 
 /* ── Point Cloud ── */
 function PointCloud({
-  abstracts, embeddings, filteredSet, filteredIndices, searchSimilarity,
-  clusterColors, topicColors, topicFilterSelected, selectedId, onHover, onSelect, onTooltipPos,
+  abstracts, embeddings, filteredSet, pickIndices, searchSimilarity,
+  clusterColors, topicColors, topicFilterSelected, selectedId, onSelect,
   listVisuals,
 }) {
   const geomRef = useRef();
   const { camera, gl } = useThree();
   const N = embeddings.length;
   const vProj = useRef(new THREE.Vector3());
-  const pickRaf = useRef(0);
-  const pendingPointer = useRef(null);
 
   const positions = useMemo(() => {
     const arr = new Float32Array(N * 3);
@@ -296,12 +1045,16 @@ function PointCloud({
     const accent = new THREE.Color();
     const topicFilterOn = topicFilterSelected.size > 0;
     for (let i = 0; i < N; i++) {
+      if (!isSemanticMapPoint(abstracts[i])) {
+        arr[i * 3] = arr[i * 3 + 1] = arr[i * 3 + 2] = 0;
+        continue;
+      }
       const topic = abstracts[i].clusterTopic || "Unknown";
-      let hex = !filteredSet.has(i) ? "#252a35"
+      let hex = !filteredSet.has(i) ? "#121212"
         : searchSimilarity ? similarityColor(searchSimilarity[i])
         : topicFilterOn
-          ? (topicColors[topic] || "#c8d8ff")
-          : (clusterColors[abstracts[i].cluster] || "#c8d8ff");
+          ? (topicColors[topic] || "#9ea4ad")
+          : (clusterColors[abstracts[i].cluster] || "#9ea4ad");
       if (filteredSet.has(i) && !searchSimilarity && listVisuals) {
         const id = abstracts[i].id;
         c.set(hex);
@@ -316,15 +1069,12 @@ function PointCloud({
         }
       }
       c.set(hex);
-      if (selectedId !== null && filteredSet.has(i) && i !== selectedId) {
-        c.multiplyScalar(0.34);
-      }
       arr[i * 3]     = c.r;
       arr[i * 3 + 1] = c.g;
       arr[i * 3 + 2] = c.b;
     }
     return arr;
-  }, [abstracts, N, filteredSet, searchSimilarity, clusterColors, topicColors, topicFilterSelected, listVisuals, selectedId]);
+  }, [abstracts, N, filteredSet, searchSimilarity, clusterColors, topicColors, topicFilterSelected, listVisuals]);
 
   useEffect(() => {
     if (!geomRef.current || N === 0) return;
@@ -332,114 +1082,64 @@ function PointCloud({
     const colAttr = new THREE.BufferAttribute(baseColors.slice(), 3);
     colAttr.setUsage(THREE.DynamicDrawUsage);
     geomRef.current.setAttribute("color", colAttr);
+    const idx = new Float32Array(N);
+    for (let i = 0; i < N; i++) idx[i] = i;
+    geomRef.current.setAttribute("aIndex", new THREE.BufferAttribute(idx, 1));
     geomRef.current.computeBoundingSphere();
   }, [positions, baseColors, N]);
 
-  const applyHover = useCallback((clientX, clientY) => {
-    const rect = gl.domElement.getBoundingClientRect();
-    const i = pickNearestScreenIndex(clientX, clientY, rect, camera, positions, filteredIndices, vProj.current);
-    if (i === null) {
-      onHover(null);
-      onTooltipPos(null);
-      return;
-    }
-    onHover(i);
-    const emb = embeddings[i];
-    if (emb) {
-      vProj.current.set(emb.x - 0.5, emb.y - 0.5, (emb.z ?? 0) - 0.5);
-      vProj.current.project(camera);
-      onTooltipPos({
-        sx: (vProj.current.x * 0.5 + 0.5) * rect.width,
-        sy: (-vProj.current.y * 0.5 + 0.5) * rect.height,
-        abstract: abstracts[i],
-      });
-    }
-  }, [gl, camera, positions, filteredIndices, embeddings, abstracts, onHover, onTooltipPos]);
-
   useEffect(() => {
     const el = gl.domElement;
-    const flushPick = () => {
-      pickRaf.current = 0;
-      const p = pendingPointer.current;
-      if (p) applyHover(p.x, p.y);
+    const onPointerMove = (e) => {
+      if (scatterOrbitActiveRef.current) {
+        const p0 = scatterOrbitPointerDownRef.current;
+        if (
+          p0 &&
+          Math.hypot(e.clientX - p0.x, e.clientY - p0.y) > SCATTER_ORBIT_DRAG_THRESHOLD_PX
+        ) {
+          scatterOrbitDragExceededRef.current = true;
+        }
+      }
     };
-    const schedulePick = (e) => {
-      pendingPointer.current = { x: e.clientX, y: e.clientY };
-      if (!pickRaf.current) pickRaf.current = requestAnimationFrame(flushPick);
-    };
-    const onLeave = () => {
-      pendingPointer.current = null;
-      onHover(null);
-      onTooltipPos(null);
+    const onPointerDown = (e) => {
+      scatterOrbitPointerDownRef.current = { x: e.clientX, y: e.clientY };
+      scatterOrbitDragExceededRef.current = false;
     };
     const onClick = (e) => {
+      if (scatterSuppressNextClickRef.current) {
+        scatterSuppressNextClickRef.current = false;
+        return;
+      }
+      if (scatterPickBlocked()) return;
       const rect = el.getBoundingClientRect();
-      const i = pickNearestScreenIndex(e.clientX, e.clientY, rect, camera, positions, filteredIndices, vProj.current);
+      const i = pickNearestScreenIndex(e.clientX, e.clientY, rect, camera, positions, pickIndices, vProj.current);
       onSelect(i);
     };
-    el.addEventListener("pointermove", schedulePick);
-    el.addEventListener("pointerleave", onLeave);
+    el.addEventListener("pointerdown", onPointerDown);
+    el.addEventListener("pointermove", onPointerMove);
     el.addEventListener("click", onClick);
     return () => {
-      el.removeEventListener("pointermove", schedulePick);
-      el.removeEventListener("pointerleave", onLeave);
+      el.removeEventListener("pointerdown", onPointerDown);
+      el.removeEventListener("pointermove", onPointerMove);
       el.removeEventListener("click", onClick);
-      if (pickRaf.current) cancelAnimationFrame(pickRaf.current);
     };
-  }, [gl, camera, positions, filteredIndices, applyHover, onHover, onTooltipPos, onSelect]);
+  }, [gl, camera, positions, pickIndices, onSelect]);
 
-  const glowTexture = useMemo(() => {
-    const sz = 32;
-    const canvas = document.createElement("canvas");
-    canvas.width = sz; canvas.height = sz;
-    const ctx = canvas.getContext("2d");
-    const grad = ctx.createRadialGradient(sz/2, sz/2, 0, sz/2, sz/2, sz/2);
-    grad.addColorStop(0,   "rgba(255,255,255,1)");
-    grad.addColorStop(0.3, "rgba(255,255,255,0.6)");
-    grad.addColorStop(1,   "rgba(255,255,255,0)");
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, sz, sz);
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.generateMipmaps = false;
-    tex.minFilter = THREE.LinearFilter;
-    return tex;
-  }, []);
-
-  const glowGeomRef = useRef();
-  useEffect(() => {
-    if (!glowGeomRef.current) return;
-    const selEmb = selectedId !== null ? embeddings[selectedId] : null;
-    if (selEmb) {
-      const pos = new Float32Array([selEmb.x - 0.5, selEmb.y - 0.5, (selEmb.z ?? 0) - 0.5]);
-      glowGeomRef.current.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-      glowGeomRef.current.setDrawRange(0, 1);
-      glowGeomRef.current.computeBoundingSphere();
-    } else {
-      glowGeomRef.current.setDrawRange(0, 0);
-    }
-  }, [selectedId, embeddings]);
+  const selectionPosition = useMemo(() => {
+    if (selectedId === null || !isSemanticMapPoint(abstracts[selectedId])) return null;
+    const e = embeddings[selectedId];
+    return [e.x - 0.5, e.y - 0.5, (e.z ?? 0) - 0.5];
+  }, [selectedId, embeddings, abstracts]);
 
   return (
     <>
       <points raycast={() => null}>
         <bufferGeometry ref={geomRef} />
-        <pointSpriteMaterial />
-      </points>
-
-      {/* Selection glow */}
-      <points frustumCulled={false} raycast={() => null}>
-        <bufferGeometry ref={glowGeomRef} />
-        <pointsMaterial
-          map={glowTexture}
-          color="#c8d8ff"
-          size={0.042}
-          sizeAttenuation
-          opacity={0.45}
-          blending={THREE.AdditiveBlending}
-          depthWrite={false}
-          transparent
+        <pointSpriteMaterial
+          uSelIndex={selectedId !== null && selectedId !== undefined ? selectedId : -1}
         />
       </points>
+      {selectionPosition ? <SelectionRing position={selectionPosition} /> : null}
     </>
   );
 }
@@ -479,6 +1179,7 @@ function SmoothZoom({ minDist, maxDist }) {
     const el = gl.domElement;
     const onWheel = (e) => {
       e.preventDefault();
+      scatterZoomActiveRef.current = true;
       const len = targetRef.current ?? camera.position.length();
       const i = nearestZoomStopIndex(len, stops);
       const next = e.deltaY > 0 ? Math.min(stops.length - 1, i + 1) : Math.max(0, i - 1);
@@ -489,12 +1190,16 @@ function SmoothZoom({ minDist, maxDist }) {
   }, [gl, camera, stops]);
 
   useFrame(() => {
-    if (targetRef.current === null) return;
+    if (targetRef.current === null) {
+      scatterZoomActiveRef.current = false;
+      return;
+    }
     const cur = camera.position.length();
     const next = cur + (targetRef.current - cur) * 0.075;
     if (Math.abs(next - targetRef.current) < 0.001) {
       camera.position.setLength(targetRef.current);
       targetRef.current = null;
+      scatterZoomActiveRef.current = false;
     } else {
       camera.position.setLength(next);
     }
@@ -510,7 +1215,6 @@ export default function AACRExplorer() {
   const [loading, setLoading] = useState(true);
   const [loadingStatus, setLoadingStatus] = useState("Fetching abstracts...");
 
-  const [hoveredId, setHoveredId] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [favoriteIds, setFavoriteIds] = useState(() => loadFavoriteIds());
   const [searchTerm, setSearchTerm] = useState("");
@@ -530,52 +1234,16 @@ export default function AACRExplorer() {
       return true;
     }
   });
-  const [showTable, setShowTable] = useState(false);
-  const [tableAgendaMode, setTableAgendaMode] = useState(false);
   const [tableHeight, setTableHeight] = useState(350);
-  const [tooltipData, setTooltipData] = useState(null);
-  const [tablePage, setTablePage] = useState(0);
+  const TABLE_INITIAL_VISIBLE = 80;
+  const TABLE_SCROLL_CHUNK = 100;
+  const [tableVisibleCount, setTableVisibleCount] = useState(TABLE_INITIAL_VISIBLE);
+  const tableBodyRef = useRef(null);
   const [autoRotate, setAutoRotate] = useState(false);
-  const [spinPaused, setSpinPaused] = useState(false);
-  const spinResumeTimer = useRef(null);
-  const TABLE_PAGE_SIZE = 50;
-  const TABLE_DOCK_MS = 340;
-
-  const [tableDockInDom, setTableDockInDom] = useState(false);
-  const [tableGridOpen, setTableGridOpen] = useState(false);
-
-  useEffect(() => {
-    if (showTable) {
-      setTableDockInDom(true);
-      setTableGridOpen(false);
-      return;
-    }
-    setTableGridOpen(false);
-    const t = window.setTimeout(() => setTableDockInDom(false), TABLE_DOCK_MS);
-    return () => window.clearTimeout(t);
-  }, [showTable]);
-
-  useEffect(() => {
-    if (!showTable || !tableDockInDom) return;
-    let raf2 = 0;
-    const raf1 = requestAnimationFrame(() => {
-      raf2 = requestAnimationFrame(() => setTableGridOpen(true));
-    });
-    return () => {
-      cancelAnimationFrame(raf1);
-      cancelAnimationFrame(raf2);
-    };
-  }, [showTable, tableDockInDom]);
-
-  useEffect(() => {
-    clearTimeout(spinResumeTimer.current);
-    if (hoveredId !== null) {
-      setSpinPaused(true);
-    } else {
-      spinResumeTimer.current = setTimeout(() => setSpinPaused(false), 300);
-    }
-    return () => clearTimeout(spinResumeTimer.current);
-  }, [hoveredId]);
+  const [tlView, setTlView] = useState({ min: 0, max: 1 });
+  const [tlFilter, setTlFilter] = useState({ min: 0, max: 1 });
+  const [sortCol, setSortCol] = useState("time");
+  const [sortDir, setSortDir] = useState("asc");
 
   const orbitControlsRef = useRef(null);
 
@@ -669,7 +1337,6 @@ export default function AACRExplorer() {
       else n.add(topic);
       return n;
     });
-    setTablePage(0);
   }, []);
 
   const toggleSessionFilter = useCallback((sess) => {
@@ -679,17 +1346,14 @@ export default function AACRExplorer() {
       else n.add(sess);
       return n;
     });
-    setTablePage(0);
   }, []);
 
   const clearTopicFilters = useCallback(() => {
     setTopicFilterSelected(new Set());
-    setTablePage(0);
   }, []);
 
   const clearSessionFilters = useCallback(() => {
     setSessionFilterSelected(new Set());
-    setTablePage(0);
   }, []);
 
   useEffect(() => {
@@ -747,21 +1411,28 @@ export default function AACRExplorer() {
   }, [abstracts]);
 
 
-  // Search similarity: 3D centroid distance
+  // Search similarity: 3D centroid distance (semantic-map points only; agenda rows stay unlit)
   const searchSimilarity = useMemo(() => {
     if (!searchTerm || searchTerm.length < 2 || embeddings.length === 0) return null;
     const term = searchTerm.trim();
     const matches = [];
     abstracts.forEach((a, i) => {
-      if (abstractMatchesSearch(a, term)) matches.push(i);
+      if (!isSemanticMapPoint(a) || !abstractMatchesSearch(a, term)) return;
+      matches.push(i);
     });
     if (matches.length === 0) return null;
     let cx = 0, cy = 0, cz = 0;
     matches.forEach((i) => { cx += embeddings[i].x; cy += embeddings[i].y; cz += embeddings[i].z; });
     cx /= matches.length; cy /= matches.length; cz /= matches.length;
-    const dists = embeddings.map((e) => Math.hypot(e.x - cx, e.y - cy, e.z - cz));
+    const dists = embeddings.map((e, i) => (
+      isSemanticMapPoint(abstracts[i])
+        ? Math.hypot(e.x - cx, e.y - cy, e.z - cz)
+        : 0
+    ));
     const maxDist = Math.max(...dists) || 1;
-    return dists.map((d) => 1 - d / maxDist);
+    return dists.map((d, i) => (
+      isSemanticMapPoint(abstracts[i]) ? 1 - d / maxDist : 0
+    ));
   }, [searchTerm, abstracts, embeddings]);
 
   // Filtered abstracts
@@ -780,6 +1451,11 @@ export default function AACRExplorer() {
 
   const filteredSet = useMemo(() => new Set(filteredIndices), [filteredIndices]);
 
+  const mapPickIndices = useMemo(
+    () => filteredIndices.filter((i) => isSemanticMapPoint(abstracts[i])),
+    [filteredIndices, abstracts],
+  );
+
   // Table resize
   const handleTableResizeStart = (e) => {
     e.preventDefault();
@@ -794,9 +1470,9 @@ export default function AACRExplorer() {
   const exportCSV = (favOnly = false) => {
     const items = favOnly ? abstracts.filter((a) => activeListIds.has(a.id)) : filteredIndices.map((i) => abstracts[i]);
     const escape = (s) => `"${String(s).replace(/"/g, '""')}"`;
-    const header = "ID,Type,Title,Authors,Institution,Session,Start,Topic,Poster Number,Presenter,Abstract";
+    const header = "ID,Type,Title,Authors,Institution,Session,Time,Topic,Poster Number,Abstract";
     const rows = items.map((a) =>
-      [a.id, a.type || "poster", a.title, a.authors.join("; "), a.institution, a.session, a.start || "", a.clusterTopic, a.posterNumber, a.presenter, a.abstract.replace(/\n/g, " ")].map(escape).join(",")
+      [a.id, a.type || "poster", a.title, unifiedPeopleText(a.authors, a.presenter), a.institution, a.session, a.start || "", a.clusterTopic, a.posterNumber, a.abstract.replace(/\n/g, " ")].map(escape).join(",")
     );
     const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -808,88 +1484,202 @@ export default function AACRExplorer() {
 
   const selected = selectedId !== null ? abstracts[selectedId] : null;
   const tableData = useMemo(() => filteredIndices.map((i) => abstracts[i]), [filteredIndices, abstracts]);
-
-  const sortedTableAbstracts = useMemo(() => {
-    const r = [...tableData];
-    if (showFavoritesOnly || tableAgendaMode) {
-      r.sort((a, b) => parseStartMs(a.start) - parseStartMs(b.start));
-    }
-    return r;
-  }, [tableData, showFavoritesOnly, tableAgendaMode]);
-
-  const totalTablePages = Math.max(1, Math.ceil(sortedTableAbstracts.length / TABLE_PAGE_SIZE));
-  const pageStart = tablePage * TABLE_PAGE_SIZE;
-  const tablePageAbstracts = useMemo(
-    () => sortedTableAbstracts.slice(pageStart, pageStart + TABLE_PAGE_SIZE),
-    [sortedTableAbstracts, pageStart],
-  );
-  const prevPageLastAbstract = pageStart > 0 ? sortedTableAbstracts[pageStart - 1] : null;
+  const timeDomain = useMemo(() => timeDomainFromRows(abstracts), [abstracts]);
+  const heatmapStats = useMemo(() => buildHourlyHeatmapStats(abstracts, timeDomain), [abstracts, timeDomain]);
+  const occurrenceMarkerTimes = useMemo(() => uniqueSortedMarkerTimes(tableData, 1200), [tableData]);
+  const selectedTimeMsForTimeline = useMemo(() => {
+    if (selectedId == null || !abstracts[selectedId]) return null;
+    const t = rowTimeMs(abstracts[selectedId]);
+    return t > 0 ? t : null;
+  }, [selectedId, abstracts]);
 
   useEffect(() => {
-    const pages = Math.max(1, Math.ceil(sortedTableAbstracts.length / TABLE_PAGE_SIZE));
-    if (tablePage > pages - 1) setTablePage(Math.max(0, pages - 1));
-  }, [sortedTableAbstracts.length, tablePage]);
+    if (!timeDomain) return;
+    setTlView({ min: timeDomain.min, max: timeDomain.max });
+    setTlFilter({ min: timeDomain.min, max: timeDomain.max });
+  }, [timeDomain?.min, timeDomain?.max]);
+
+  const handleTimelineFilterChange = useCallback(
+    (range, meta) => {
+      setTlFilter(range);
+      if (meta?.reason !== "selectCommit" || !timeDomain) return;
+      const d0 = timeDomain.min;
+      const d1 = timeDomain.max;
+      const a = range.min;
+      const b = range.max;
+      const span = Math.max(b - a, MIN);
+      const pad = Math.max(span * 0.04, 2 * MIN);
+      let v0 = Math.max(d0, a - pad);
+      let v1 = Math.min(d1, b + pad);
+      let win = v1 - v0;
+      const domainW = d1 - d0;
+      const minWin = Math.min(TL_MIN_ZOOM_WINDOW_MS, domainW);
+      if (win < minWin) {
+        const mid = (a + b) / 2;
+        v0 = Math.max(d0, mid - minWin / 2);
+        v1 = Math.min(d1, mid + minWin / 2);
+        if (v1 - v0 < minWin) {
+          v0 = d0;
+          v1 = d1;
+        }
+      }
+      setTlView({ min: v0, max: v1 });
+    },
+    [timeDomain],
+  );
+
+  useEffect(() => {
+    if (sortCol === "id" || sortCol === "presenter") {
+      setSortCol("time");
+      setSortDir("asc");
+    }
+  }, [sortCol]);
+
+  const toggleTableSort = useCallback((col) => {
+    if (col === sortCol) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    else {
+      setSortCol(col);
+      setSortDir("asc");
+    }
+  }, [sortCol]);
+
+  const timeFilteredTableData = useMemo(() => {
+    if (!timeDomain) return tableData;
+    const fMin = tlFilter.min;
+    const fMax = tlFilter.max;
+    const atFull = fMin <= timeDomain.min + 1000 && fMax >= timeDomain.max - 1000;
+    return tableData.filter((a) => {
+      const t = rowTimeMs(a);
+      if (!t) return atFull;
+      return t >= fMin && t <= fMax;
+    });
+  }, [tableData, timeDomain, tlFilter]);
+
+  const sortedTableAbstracts = useMemo(() => {
+    const r = [...timeFilteredTableData];
+    r.sort((a, b) => compareTableRows(a, b, sortCol, sortDir, activeListIds));
+    return r;
+  }, [timeFilteredTableData, sortCol, sortDir, activeListIds]);
+
+  const visibleTableAbstracts = useMemo(
+    () => sortedTableAbstracts.slice(0, Math.min(tableVisibleCount, sortedTableAbstracts.length)),
+    [sortedTableAbstracts, tableVisibleCount],
+  );
+
+  useEffect(() => {
+    setTableVisibleCount(TABLE_INITIAL_VISIBLE);
+    if (tableBodyRef.current) tableBodyRef.current.scrollTop = 0;
+  }, [
+    searchTerm,
+    topicFilterSelected,
+    sessionFilterSelected,
+    typeFilter,
+    showFavoritesOnly,
+    tlFilter.min,
+    tlFilter.max,
+    sortCol,
+    sortDir,
+  ]);
+
+  const onTableBodyScroll = useCallback(
+    (e) => {
+      const el = e.currentTarget;
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 120) {
+        setTableVisibleCount((c) => Math.min(c + TABLE_SCROLL_CHUNK, sortedTableAbstracts.length));
+      }
+    },
+    [sortedTableAbstracts.length, TABLE_SCROLL_CHUNK],
+  );
 
   if (loading) {
     return (
-      <div style={{ width: "100vw", height: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#151720", color: "#8a919c", fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
+      <div style={{ width: "100vw", height: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#080808", color: "#8a919c", fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
         <style>{`@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&family=DM+Sans:wght@400;500;600;700&display=swap'); @keyframes pulse { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }`}</style>
-        <div style={{ fontSize: 16, letterSpacing: 6, textTransform: "uppercase", marginBottom: 36, color: "#00ff9f", animation: "pulse 2s infinite" }}>AACR 2026 Explorer</div>
+        <div style={{ fontSize: 16, letterSpacing: 6, textTransform: "uppercase", marginBottom: 36, color: "#d4d4d8", animation: "pulse 2s infinite" }}>AACR 2026 Explorer</div>
         <div style={{ fontSize: 18, color: "#c8cdd6" }}>{loadingStatus}</div>
       </div>
     );
   }
 
   return (
-    <div style={{ width: "100vw", height: "100vh", overflow: "hidden", background: "#151720", color: "#e8eaef", fontFamily: "'JetBrains Mono', 'Fira Code', monospace", position: "relative" }}>
+    <div style={{ width: "100vw", height: "100vh", overflow: "hidden", background: "#080808", color: "#e8eaef", fontFamily: "'JetBrains Mono', 'Fira Code', monospace", position: "relative" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap');
         * { box-sizing: border-box; margin: 0; padding: 0; }
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.16); border-radius: 4px; }
-        .top-bar { position: fixed; top: 0; left: 0; right: 0; height: ${TOP_BAR_PX}px; z-index: 50; display: flex; align-items: center; gap: 10px; padding: 0 12px 0 8px; background: rgba(26,28,38,0.97); backdrop-filter: blur(14px); border-bottom: 1px solid rgba(255,255,255,0.1); }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 4px; }
+        .top-bar { position: fixed; top: 0; left: 0; right: 0; height: ${TOP_BAR_PX}px; z-index: 50; display: flex; align-items: center; gap: 10px; padding: 0 12px 0 8px; background: rgba(14,14,15,0.97); backdrop-filter: blur(14px); border-bottom: 1px solid rgba(255,255,255,0.1); }
         .sidebar-toggle { flex-shrink: 0; width: 40px; height: 36px; display: flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.12); border-radius: 4px; background: rgba(255,255,255,0.06); color: #a0a6b4; cursor: pointer; font-size: 18px; transition: all 0.15s; }
-        .sidebar-toggle:hover { border-color: rgba(0,255,159,0.35); color: #00ff9f; }
-        .top-bar .logo { font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 16px; color: #00ff9f; letter-spacing: 3px; text-transform: uppercase; white-space: nowrap; user-select: none; flex-shrink: 0; }
+        .sidebar-toggle:hover { border-color: rgba(212,212,216,0.34); color: #d4d4d8; }
+        .top-bar .logo { font-family: 'DM Sans', sans-serif; font-weight: 700; font-size: 16px; color: #d4d4d8; letter-spacing: 3px; text-transform: uppercase; white-space: nowrap; user-select: none; flex-shrink: 0; }
         .top-bar .logo span { color: #7d8594; font-weight: 400; }
-        .top-bar-search:focus { border-color: rgba(0,255,159,0.4); }
+        .top-bar-search:focus { border-color: rgba(212,212,216,0.38); }
         .top-bar-search::placeholder { color: #7d8594; }
         .top-bar-tools { display: flex; align-items: center; gap: 6px; flex-shrink: 0; margin-left: auto; }
         .top-bar-search { flex: 1; min-width: 120px; max-width: 520px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); color: #e4e7ed; font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 7px 12px; border-radius: 4px; outline: none; transition: border-color 0.2s; }
         .type-filter-wrap { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
         .filter-dropdown-wrap { display: flex; align-items: center; gap: 8px; flex-shrink: 0; position: relative; z-index: 55; }
-        .filter-dropdown-panel { position: absolute; top: calc(100% + 8px); left: 0; min-width: 300px; max-width: min(420px, calc(100vw - 24px)); max-height: min(72vh, 520px); z-index: 60; display: flex; flex-direction: column; padding: 10px 12px; background: rgba(32,34,46,0.98); border: 1px solid rgba(255,255,255,0.14); border-radius: 6px; box-shadow: 0 12px 40px rgba(0,0,0,0.35); transform-origin: top left; animation: paneDropIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) both; }
+        .filter-dropdown-panel { position: absolute; top: calc(100% + 8px); left: 0; min-width: 300px; max-width: min(420px, calc(100vw - 24px)); max-height: min(72vh, 520px); z-index: 60; display: flex; flex-direction: column; padding: 10px 12px; background: rgba(20,20,21,0.98); border: 1px solid rgba(255,255,255,0.14); border-radius: 6px; box-shadow: 0 12px 40px rgba(0,0,0,0.35); transform-origin: top left; animation: paneDropIn 0.24s cubic-bezier(0.22, 1, 0.36, 1) both; }
         .filter-dropdown-wrap > div:nth-child(2) .filter-dropdown-panel { left: auto; right: 0; transform-origin: top right; }
         .filter-check-list { overflow-y: auto; flex: 1; min-height: 0; margin-top: 8px; max-height: 280px; border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; padding: 4px 0; background: rgba(0,0,0,0.12); }
         .filter-check-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 10px; font-size: 12px; color: #c4cad4; cursor: pointer; }
-        .filter-check-row:hover { background: rgba(0,255,159,0.06); }
-        .filter-check-row input { margin-top: 2px; accent-color: #00ff9f; flex-shrink: 0; }
+        .filter-check-row:hover { background: rgba(212,212,216,0.065); }
+        .filter-check-row input { margin-top: 2px; accent-color: #d4d4d8; flex-shrink: 0; }
         .filter-check-label { flex: 1; line-height: 1.4; min-width: 0; }
         .app-main { position: fixed; z-index: 1; display: flex; flex-direction: column; overflow: hidden; transition: left 0.32s cubic-bezier(0.22, 1, 0.36, 1); }
         .main-vis { flex: 1 1 auto; min-height: 0; position: relative; }
         .canvas-wrap { position: absolute; inset: 0; z-index: 1; overflow: hidden; }
-        .legend-floating { position: absolute; top: 14px; right: 14px; bottom: auto; width: min(300px, calc(100% - 28px)); max-height: min(38vh, calc(100% - 28px)); z-index: 22; background: rgba(28,30,42,0.96); border: 1px solid rgba(255,255,255,0.12); backdrop-filter: blur(12px); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.3); animation: legendPaneIn 0.28s cubic-bezier(0.22, 1, 0.36, 1) both; }
-        .legend-tab { position: absolute; top: 14px; right: 14px; bottom: auto; z-index: 22; background: rgba(28,30,42,0.96); border: 1px solid rgba(255,255,255,0.14); color: #c4cad4; font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 8px 12px; border-radius: 6px; cursor: pointer; letter-spacing: 1px; text-transform: uppercase; animation: legendPaneIn 0.28s cubic-bezier(0.22, 1, 0.36, 1) both; }
-        .hints { position: absolute; bottom: 16px; left: 14px; z-index: 18; text-align: left; user-select: none; max-width: min(320px, 45vw); }
+        .legend-floating { position: absolute; top: 14px; right: 14px; bottom: auto; width: min(300px, calc(100% - 28px)); max-height: min(38vh, calc(100% - 28px)); z-index: 22; background: rgba(18,18,19,0.96); border: 1px solid rgba(255,255,255,0.12); backdrop-filter: blur(12px); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.3); animation: legendPaneIn 0.28s cubic-bezier(0.22, 1, 0.36, 1) both; }
+        .legend-tab { position: absolute; top: 14px; right: 14px; bottom: auto; z-index: 22; background: rgba(18,18,19,0.96); border: 1px solid rgba(255,255,255,0.14); color: #c4cad4; font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 8px 12px; border-radius: 6px; cursor: pointer; letter-spacing: 1px; text-transform: uppercase; animation: legendPaneIn 0.28s cubic-bezier(0.22, 1, 0.36, 1) both; }
+        .hints { position: absolute; top: 14px; left: 14px; right: auto; bottom: auto; z-index: 24; text-align: left; user-select: none; max-width: min(280px, 42vw); pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.85); }
         .favorites-list { margin-top: 10px; border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; max-height: 42vh; overflow-y: auto; background: rgba(0,0,0,0.1); }
         .fav-row { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); cursor: pointer; font-size: 12px; color: #b8c0cc; }
-        .fav-row:hover { background: rgba(0,255,159,0.06); color: #f0f2f5; }
+        .fav-row:hover { background: rgba(212,212,216,0.065); color: #f0f2f5; }
         .fav-row-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.4; }
         .fav-row-remove { opacity: 0; flex-shrink: 0; width: 28px; height: 28px; border: none; background: rgba(255,80,80,0.12); color: #ff6b6b; border-radius: 4px; cursor: pointer; font-size: 18px; line-height: 1; transition: opacity 0.12s; }
         .fav-row:hover .fav-row-remove { opacity: 1; }
-        .table-dock-shell { flex-shrink: 0; display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.34s cubic-bezier(0.22, 1, 0.36, 1); }
-        .table-dock-shell.is-open { grid-template-rows: 1fr; }
-        .table-dock-shell-inner { min-height: 0; overflow: hidden; }
-        .table-dock { display: flex; flex-direction: column; border-top: 1px solid rgba(255,255,255,0.12); background: rgba(26,28,38,0.99); backdrop-filter: blur(16px); box-shadow: 0 -8px 32px rgba(0,0,0,0.32); z-index: 12; }
+        .table-dock-wrap { flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; }
+        .table-dock { display: flex; flex-direction: column; border-top: 1px solid rgba(255,255,255,0.12); background: rgba(14,14,15,0.99); backdrop-filter: blur(16px); box-shadow: 0 -8px 32px rgba(0,0,0,0.32); z-index: 12; }
         .table-dock .table-panel { width: 100%; max-height: none; }
+        .table-time-filter { padding: 10px 16px 6px; border-bottom: 1px solid rgba(255,255,255,0.08); flex-shrink: 0; }
+        .table-time-filter-label { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: #9aa3b0; }
+        .table-time-clear { padding: 2px 8px !important; font-size: 10px !important; }
+        .table-time-filter-map-surface { width: 100%; display: flex; flex-direction: column; position: relative; }
+        .table-time-filter-axis { position: relative; width: 100%; padding-top: 20px; }
+        .table-time-zoom-legend { position: absolute; top: 0; left: 0; z-index: 6; display: flex; flex-direction: column; gap: 1px; font-size: 9px; line-height: 1.25; color: #c4cad4; pointer-events: none; text-shadow: 0 1px 3px rgba(0,0,0,0.85); }
+        .table-time-zoom-legend-sub { font-size: 8px; color: #8d95a3; letter-spacing: 0.3px; }
+        .table-time-filter-vrules { position: absolute; left: 0; right: 0; top: 20px; bottom: 0; pointer-events: none; z-index: 1; }
+        .table-time-filter-vrule { position: absolute; top: 0; bottom: 0; width: 0; margin-left: -0.5px; background: none; pointer-events: none; }
+        .table-time-filter-vrule--day { border-left: 2px solid rgba(200, 214, 228, 0.88); margin-left: -1px; }
+        .table-time-filter-vrule--hour { border-left: 1px dotted rgba(140, 175, 220, 0.78); }
+        .table-time-filter-vrule--sub { border-left: 1px dashed rgba(255, 255, 255, 0.28); }
+        .table-time-filter-tickstrip { position: relative; height: 15px; margin-bottom: 4px; font-size: 9px; color: #8d95a3; pointer-events: none; z-index: 2; }
+        .table-time-filter-tick { position: absolute; top: 0; transform: translateX(-50%); max-width: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .table-time-filter-track { position: relative; height: 28px; background: rgba(0,0,0,0.25); border-radius: 4px; border: 1px solid rgba(255,255,255,0.1); touch-action: none; z-index: 2; }
+        .table-time-filter-heatmap-wrap { position: absolute; inset: 0; pointer-events: none; z-index: 0; border-radius: 3px; overflow: hidden; }
+        .table-time-filter-heatcell { position: absolute; top: 0; bottom: 0; box-sizing: border-box; border-right: 1px solid rgba(0,0,0,0.18); }
+        .table-time-filter-occ-layer { position: absolute; inset: 0; pointer-events: none; z-index: 3; }
+        .table-time-filter-occ { position: absolute; top: 0; bottom: 0; width: 0; margin-left: -0.5px; border-left: 1px solid rgba(120, 195, 255, 0.55); }
+        .table-time-filter-occ--selected { border-left: 2px solid rgba(255, 217, 61, 0.92); margin-left: -1px; z-index: 1; }
+        .table-time-filter-brush { position: absolute; top: 0; bottom: 0; background: rgba(212,212,216,0.14); border-left: 1px solid rgba(212,212,216,0.32); border-right: 1px solid rgba(212,212,216,0.32); pointer-events: none; box-sizing: border-box; z-index: 2; }
+        .table-time-filter-brush--preview { background: rgba(212,212,216,0.1); border-left: 1px dashed rgba(212,212,216,0.45); border-right: 1px dashed rgba(212,212,216,0.45); }
+        .table-time-cursor-hint { pointer-events: none; font-size: 10px; line-height: 1.3; color: #e4e7ed; background: rgba(12,12,13,0.94); border: 1px solid rgba(255,255,255,0.14); padding: 4px 8px; border-radius: 4px; white-space: nowrap; box-shadow: 0 4px 14px rgba(0,0,0,0.35); }
+        .table-time-filter-ticks { display: flex; justify-content: space-between; align-items: flex-start; margin-top: 6px; font-size: 10px; color: #8d95a3; gap: 8px; }
+        .table-time-edge { flex: 0 1 42%; min-width: 0; line-height: 1.35; }
+        .table-time-edge:first-child { text-align: left; }
+        .table-time-edge:last-child { text-align: right; }
+        .table-time-filter-hint { opacity: 0.85; font-size: 9px; letter-spacing: 0.5px; text-align: center; flex: 1; min-width: 0; }
+        .table-body th.table-sortable { cursor: pointer; user-select: none; }
+        .table-body th.table-sortable:hover { color: #d4d4d8; }
+        .table-body th.table-sort-active { color: #e4e7ed; }
 
         .stat { font-size: 11px; color: #8d95a3; letter-spacing: 1px; text-transform: uppercase; white-space: nowrap; }
-        .stat b { color: #00ff9f; font-weight: 500; }
+        .stat b { color: #d4d4d8; font-weight: 500; }
         .ctrl-btn { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: #c4cad4; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 6px 10px; border-radius: 4px; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
-        .ctrl-btn:hover { background: rgba(0,255,159,0.06); border-color: rgba(0,255,159,0.3); color: #00ff9f; }
-        .ctrl-btn.active { background: rgba(0,255,159,0.1); border-color: rgba(0,255,159,0.4); color: #00ff9f; }
-        .app-sidebar { position: fixed; top: ${TOP_BAR_PX}px; left: 0; width: ${SIDEBAR_WIDTH_PX}px; bottom: 0; z-index: 25; display: flex; flex-direction: column; background: rgba(28,30,40,0.97); backdrop-filter: blur(18px); border-right: 1px solid rgba(255,255,255,0.1); transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1); will-change: transform; }
+        .ctrl-btn:hover { background: rgba(212,212,216,0.065); border-color: rgba(212,212,216,0.30); color: #d4d4d8; }
+        .ctrl-btn.active { background: rgba(212,212,216,0.11); border-color: rgba(212,212,216,0.38); color: #d4d4d8; }
+        .app-sidebar { position: fixed; top: ${TOP_BAR_PX}px; left: 0; width: ${SIDEBAR_WIDTH_PX}px; bottom: 0; z-index: 25; display: flex; flex-direction: column; background: rgba(18,18,19,0.97); backdrop-filter: blur(18px); border-right: 1px solid rgba(255,255,255,0.1); transition: transform 0.32s cubic-bezier(0.22, 1, 0.36, 1); will-change: transform; }
         .app-sidebar.is-collapsed { transform: translateX(-100%); pointer-events: none; }
         .sidebar-section { flex: 1 1 50%; min-height: 0; overflow-y: auto; padding: 12px 14px; }
         .sidebar-lists { border-bottom: 1px solid rgba(255,255,255,0.1); }
@@ -899,12 +1689,12 @@ export default function AACRExplorer() {
         .sidebar-row select, .sidebar-row .filter-q { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); color: #e0e4ea; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 5px 8px; border-radius: 4px; outline: none; }
         .sidebar-row select { flex: 1; min-width: 120px; }
         .filter-q { width: 100%; margin-top: 4px; }
-        .filter-q:focus { border-color: rgba(0,255,159,0.35); }
+        .filter-q:focus { border-color: rgba(212,212,216,0.34); }
         .filter-hint { font-size: 10px; color: #8d95a3; margin-top: 4px; }
         .filter-pick-list { max-height: 100px; overflow-y: auto; border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; margin-top: 4px; background: rgba(0,0,0,0.12); }
         .filter-pick-row { padding: 5px 8px; font-size: 11px; cursor: pointer; color: #b0b8c4; border-bottom: 1px solid rgba(255,255,255,0.06); line-height: 1.3; }
-        .filter-pick-row:hover { background: rgba(0,255,159,0.06); color: #f0f2f5; }
-        .filter-pick-row.active { color: #00ff9f; }
+        .filter-pick-row:hover { background: rgba(212,212,216,0.065); color: #f0f2f5; }
+        .filter-pick-row.active { color: #d4d4d8; }
         .sidebar-details { display: flex; flex-direction: column; }
         .sidebar-details-inner { position: relative; padding-top: 4px; }
         .sidebar-details-inner .close-btn { position: static; float: right; width: 32px; height: 32px; margin: 0 0 8px 8px; }
@@ -914,7 +1704,7 @@ export default function AACRExplorer() {
         .detail-meta b { color: #d8dee6; font-weight: 500; }
         .detail-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }
         .detail-tag { font-size: 11px; padding: 4px 8px; border-radius: 3px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); color: #a8b0bc; letter-spacing: 0.5px; text-transform: uppercase; }
-        .detail-tag.topic { border-color: var(--topic-color, #00ff9f); color: var(--topic-color, #00ff9f); background: rgba(0,255,159,0.08); }
+        .detail-tag.topic { border-color: var(--topic-color, #d4d4d8); color: var(--topic-color, #d4d4d8); background: rgba(212,212,216,0.085); }
         .detail-abstract { font-family: 'DM Sans', sans-serif; font-size: 14px; line-height: 1.75; color: #c4cad4; margin-top: 14px; white-space: pre-wrap; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 14px; }
         .fav-btn { display: inline-flex; align-items: center; gap: 6px; background: rgba(255,217,61,0.05); border: 1px solid rgba(255,217,61,0.15); color: #ffd93d; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 7px 14px; border-radius: 4px; cursor: pointer; transition: all 0.15s; margin-top: 12px; }
         .fav-btn:hover { background: rgba(255,217,61,0.1); }
@@ -923,45 +1713,35 @@ export default function AACRExplorer() {
         .close-btn:hover { border-color: #ff6b6b; color: #ff6b6b; }
         .detail-empty { color: #9aa3b0; font-size: 12px; line-height: 1.65; padding: 16px 0; }
 
-        .tooltip { position: absolute; z-index: 30; background: rgba(30,32,44,0.97); border: 1px solid rgba(255,255,255,0.12); backdrop-filter: blur(12px); padding: 12px 14px; border-radius: 6px; pointer-events: none; max-width: min(420px, 90%); animation: tooltipIn 0.22s cubic-bezier(0.22, 1, 0.36, 1); }
-        @keyframes tooltipIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
-        .tooltip h4 { font-family: 'DM Sans', sans-serif; font-size: 14px; font-weight: 500; color: #f0f2f5; margin-bottom: 6px; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-        .tooltip p { font-size: 12px; color: #b4bcc8; line-height: 1.35; }
-
         .legend-floating .legend-scroll { overflow-y: auto; flex: 1; min-height: 0; margin-top: 6px; }
         .legend-floating h5 { font-size: 10px; color: #9aa3b0; letter-spacing: 2px; text-transform: uppercase; }
         .legend-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
         .legend-collapse { background: none; border: none; color: #a8b0bc; cursor: pointer; font-size: 18px; line-height: 1; padding: 2px 6px; border-radius: 4px; }
-        .legend-collapse:hover { color: #00ff9f; }
+        .legend-collapse:hover { color: #d4d4d8; }
 
-        .legend-tab:hover { color: #00ff9f; border-color: rgba(0,255,159,0.3); }
+        .legend-tab:hover { color: #d4d4d8; border-color: rgba(212,212,216,0.30); }
         .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #b4bcc8; margin-bottom: 4px; cursor: pointer; transition: color 0.15s; }
         .legend-item:hover { color: #f0f2f5; }
         .legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
         .legend-count { color: #7d8594; margin-left: auto; font-size: 10px; }
-        .table-panel { background: transparent; display: flex; flex-direction: column; }
+        .table-panel { background: transparent; display: flex; flex-direction: column; min-height: 0; }
+        .table-panel-main { display: flex; flex-direction: column; flex: 1; min-height: 0; }
         @keyframes paneDropIn { from { opacity: 0; transform: translateY(-8px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
         @keyframes legendPaneIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
         .table-resize-handle { height: 6px; cursor: ns-resize; background: transparent; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
         .table-resize-handle::after { content: ''; width: 40px; height: 3px; border-radius: 2px; background: rgba(255,255,255,0.18); }
-        .table-resize-handle:hover::after { background: rgba(0,255,159,0.35); }
+        .table-resize-handle:hover::after { background: rgba(212,212,216,0.34); }
         .table-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid rgba(255,255,255,0.1); flex-shrink: 0; }
         .table-header span { font-size: 12px; color: #9aa3b0; letter-spacing: 2px; text-transform: uppercase; }
         .table-body { overflow-y: auto; flex: 1; }
         .table-body table { width: 100%; border-collapse: collapse; font-size: 12px; }
-        .table-body th { position: sticky; top: 0; background: #22242e; color: #a8b0bc; font-weight: 500; text-align: left; padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.1); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; white-space: nowrap; }
+        .table-body th { position: sticky; top: 0; background: #101010; color: #a8b0bc; font-weight: 500; text-align: left; padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.1); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; white-space: nowrap; }
         .table-body td { padding: 9px 12px; border-bottom: 1px solid rgba(255,255,255,0.06); color: #c4cad4; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .table-body tr { cursor: pointer; transition: background 0.1s; }
-        .table-body tr:hover { background: rgba(0,255,159,0.05); }
+        .table-body tr:hover { background: rgba(212,212,216,0.055); }
         .table-body tr:hover td { color: #f0f2f5; }
-        .table-body tr.table-agenda-date td { background: rgba(0,255,159,0.06); color: #00ff9f; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 600; border-bottom: 1px solid rgba(0,255,159,0.12); cursor: default; }
+        .table-body tr.table-agenda-date td { background: rgba(212,212,216,0.065); color: #d4d4d8; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; font-weight: 600; border-bottom: 1px solid rgba(212,212,216,0.13); cursor: default; }
         .table-body tr.table-agenda-date:hover { background: transparent; }
-        .table-pager { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        .table-pager button { background: none; border: 1px solid rgba(255,255,255,0.1); color: #b0b8c4; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border-radius: 3px; cursor: pointer; }
-        .table-pager button:hover { border-color: rgba(0,255,159,0.3); color: #00ff9f; }
-        .table-pager button:disabled { opacity: 0.3; cursor: default; }
-        .table-pager span { font-size: 12px; color: #9aa3b0; }
-
         .hints p { font-size: 10px; color: #8d95a3; letter-spacing: 1px; line-height: 1.75; }
         .hints p b { color: #c4cad4; }
       `}</style>
@@ -982,7 +1762,7 @@ export default function AACRExplorer() {
           className="top-bar-search"
           placeholder="Search titles, topics, sessions, authors, keywords..."
           value={searchTerm}
-          onChange={(e) => { setSearchTerm(e.target.value); setTablePage(0); }}
+          onChange={(e) => setSearchTerm(e.target.value)}
         />
         <div className="filter-dropdown-wrap">
           <div style={{ position: "relative" }}>
@@ -1067,17 +1847,17 @@ export default function AACRExplorer() {
           <button
             type="button"
             className={`ctrl-btn${typeFilter === null ? " active" : ""}`}
-            onClick={() => { setTypeFilter(null); setTablePage(0); }}
+            onClick={() => setTypeFilter(null)}
           >All</button>
           <button
             type="button"
             className={`ctrl-btn${typeFilter === "poster" ? " active" : ""}`}
-            onClick={() => { setTypeFilter("poster"); setTablePage(0); }}
+            onClick={() => setTypeFilter("poster")}
           >Posters</button>
           <button
             type="button"
             className={`ctrl-btn${typeFilter === "talk" ? " active" : ""}`}
-            onClick={() => { setTypeFilter("talk"); setTablePage(0); }}
+            onClick={() => setTypeFilter("talk")}
           >Talks</button>
         </div>
         <div className="top-bar-tools">
@@ -1106,8 +1886,6 @@ export default function AACRExplorer() {
               </button>
             </div>
             <div className="sidebar-row">
-              <button type="button" className={`ctrl-btn ${showTable ? "active" : ""}`} onClick={() => { setShowTable(!showTable); setTablePage(0); }}>Table</button>
-              <button type="button" className={`ctrl-btn ${tableAgendaMode ? "active" : ""}`} onClick={() => { setTableAgendaMode((v) => !v); setTablePage(0); }}>Agenda</button>
               <button type="button" className="ctrl-btn" onClick={() => exportCSV(false)}>Export all</button>
             </div>
             <div className="favorites-list">
@@ -1143,10 +1921,9 @@ export default function AACRExplorer() {
             {selected ? (
               <div className="sidebar-details-inner detail-panel">
                 <button type="button" className="close-btn" title="Clear selection" onClick={() => setSelectedId(null)}>×</button>
-                <div style={{ fontSize: 10, color: "#8d95a3", letterSpacing: 2, marginBottom: 10 }}>#{selected.id} · {selected.type === "talk" ? "TALK" : `POSTER ${selected.posterNumber}`} · {selected.start}</div>
+                <div style={{ fontSize: 10, color: "#8d95a3", letterSpacing: 2, marginBottom: 10 }}>#{selected.id} · {selected.type === "talk" ? "TALK" : `POSTER ${selected.posterNumber}`} · {formatAbstractTimeLabel(selected.start)}</div>
                 <h2>{selected.title}</h2>
-                <div className="detail-meta"><b>Presenter:</b> {selected.presenter}</div>
-                <AffiliationView institution={selected.institution} authors={selected.authors} />
+                <AffiliationView institution={selected.institution} authors={selected.authors} presenter={selected.presenter} />
                 <div className="detail-meta"><b>Session:</b> {selected.session}</div>
                 <div className="detail-tags">
                   <span className="detail-tag topic" style={{ "--topic-color": topicColors[selected.clusterTopic] }}>{selected.clusterTopic}</span>
@@ -1182,20 +1959,18 @@ export default function AACRExplorer() {
               style={{ width: "100%", height: "100%", display: "block" }}
               gl={{ antialias: true }}
             >
-              <color attach="background" args={["#151720"]} />
+              <color attach="background" args={["#080808"]} />
               <PointCloud
                 abstracts={abstracts}
                 embeddings={embeddings}
                 filteredSet={filteredSet}
-                filteredIndices={filteredIndices}
+                pickIndices={mapPickIndices}
                 searchSimilarity={searchSimilarity}
                 clusterColors={clusterColors}
                 topicColors={topicColors}
                 topicFilterSelected={topicFilterSelected}
                 selectedId={selectedId}
-                onHover={setHoveredId}
                 onSelect={setSelectedId}
-                onTooltipPos={setTooltipData}
                 listVisuals={listVisuals}
               />
 
@@ -1207,26 +1982,26 @@ export default function AACRExplorer() {
                 minDistance={ZOOM_MIN}
                 maxDistance={ZOOM_MAX}
                 target={[0, 0, 0]}
-                autoRotate={autoRotate && !spinPaused}
+                autoRotate={autoRotate}
                 autoRotateSpeed={0.5}
+                onStart={() => {
+                  scatterOrbitActiveRef.current = true;
+                }}
+                onEnd={() => {
+                  scatterOrbitActiveRef.current = false;
+                  if (scatterOrbitDragExceededRef.current) {
+                    scatterSuppressNextClickRef.current = true;
+                    scatterOrbitDragExceededRef.current = false;
+                  }
+                  scatterOrbitPointerDownRef.current = null;
+                }}
               />
               <SmoothZoom minDist={ZOOM_MIN} maxDist={ZOOM_MAX} />
               <GizmoHelper alignment="bottom-right" margin={[72, 168]}>
-                <GizmoViewport axisColors={["#ff6b6b", "#00ff9f", "#60a5fa"]} labelColor="white" />
+                <GizmoViewport axisColors={["#b09090", "#b0b0b4", "#9098a0"]} labelColor="#d0d0d4" />
               </GizmoHelper>
             </Canvas>
 
-            {tooltipData && !selected && (
-              <div
-                className="tooltip"
-                style={{ left: tooltipData.sx + 14, top: tooltipData.sy + 14 }}
-              >
-                <h4>{tooltipData.abstract.title}</h4>
-                <p>{tooltipData.abstract.authors.slice(0, 3).join(", ")}{tooltipData.abstract.authors.length > 3 ? " et al." : ""}</p>
-                <p style={{ color: topicColors[tooltipData.abstract.clusterTopic], marginTop: 2 }}>{tooltipData.abstract.clusterTopic} · {tooltipData.abstract.type === "talk" ? "TALK" : `#${tooltipData.abstract.posterNumber}`}</p>
-                {tooltipData.abstract.start && <p style={{ marginTop: 4, color: "#a8b0bc" }}>{tooltipData.abstract.start}</p>}
-              </div>
-            )}
           </div>
 
           {legendExpanded ? (
@@ -1249,72 +2024,87 @@ export default function AACRExplorer() {
             <button type="button" className="legend-tab" onClick={() => setLegendExpanded(true)}>Topics</button>
           )}
 
-          {!showTable && (
-            <div className="hints">
-              <p>DRAG <b>ROTATE</b> · SCROLL <b>ZOOM</b> · RIGHT-DRAG <b>PAN</b></p>
-              <p>SHIFT + DRAG <b>LOCK HORIZONTAL</b></p>
-            </div>
-          )}
+          <div className="hints">
+            <p>DRAG <b>ROTATE</b> · SCROLL <b>ZOOM</b> · RIGHT-DRAG <b>PAN</b></p>
+            <p>SHIFT + DRAG <b>LOCK HORIZONTAL</b></p>
+          </div>
         </div>
 
-        {tableDockInDom && (
-          <div className={`table-dock-shell${tableGridOpen ? " is-open" : ""}`}>
-            <div className="table-dock-shell-inner">
-              <div className="table-dock">
-                <div className="table-panel" style={{ height: tableHeight }} onClick={(e) => e.stopPropagation()}>
-                  <div className="table-resize-handle" onMouseDown={handleTableResizeStart} />
-                  <div className="table-header">
-                    <span>Abstracts ({sortedTableAbstracts.length})</span>
-                    <div className="table-pager">
-                      <button type="button" className={`ctrl-btn ${tableAgendaMode ? "active" : ""}`} style={{ padding: "4px 10px", fontSize: 12 }} onClick={() => { setTableAgendaMode((v) => !v); setTablePage(0); }}>Agenda</button>
-                      <button type="button" disabled={tablePage === 0} onClick={() => setTablePage((p) => p - 1)}>Prev</button>
-                      <span>{tablePage + 1} / {totalTablePages}</span>
-                      <button type="button" disabled={tablePage >= totalTablePages - 1} onClick={() => setTablePage((p) => p + 1)}>Next</button>
-                      <button type="button" className="close-btn" style={{ position: "static", width: 28, height: 28, fontSize: 16 }} onClick={() => setShowTable(false)}>×</button>
-                    </div>
-                  </div>
-                  <div className="table-body">
-                    <table>
-                      <thead><tr><th>ID</th><th>Type</th><th>Start</th><th>Poster</th><th>Title</th><th>Presenter</th><th>Session</th><th>Topic</th><th>Fav</th></tr></thead>
-                      <tbody>
-                        {tablePageAbstracts.flatMap((a, idx) => {
-                          const prev = idx === 0 ? prevPageLastAbstract : tablePageAbstracts[idx - 1];
-                          const showDate = tableAgendaMode && (
-                            !prev || formatAgendaDate(parseStartMs(a.start)) !== formatAgendaDate(parseStartMs(prev.start))
-                          );
-                          const rows = [];
-                          if (showDate) {
-                            rows.push(
-                              <tr key={`agenda-hdr-${a.internalId}-${idx}`} className="table-agenda-date">
-                                <td colSpan={9}>{formatAgendaDate(parseStartMs(a.start))}</td>
-                              </tr>
-                            );
-                          }
-                          rows.push(
-                            <tr key={a.id + String(a.internalId)} onClick={() => { const i = abstracts.findIndex((x) => x.id === a.id); setSelectedId(i >= 0 ? i : null); }}>
-                              <td style={{ color: "#8d95a3", whiteSpace: "nowrap" }}>{a.id}</td>
-                              <td style={{ whiteSpace: "nowrap", color: a.type === "talk" ? "#48dbfb" : "#a8b0bc", textTransform: "uppercase", fontSize: 10, letterSpacing: 1 }}>{a.type || "poster"}</td>
-                              <td style={{ whiteSpace: "nowrap", color: "#b0b8c4" }}>{a.start || "—"}</td>
-                              <td style={{ whiteSpace: "nowrap", color: "#a8b0bc" }}>{a.posterNumber || "—"}</td>
-                              <td style={{ color: "#e4e7ed", maxWidth: 280 }}>{a.title}</td>
-                              <td style={{ maxWidth: 160 }}>{a.presenter}</td>
-                              <td style={{ maxWidth: 180 }}>{a.session}</td>
-                              <td style={{ color: topicColors[a.clusterTopic], maxWidth: 160 }}>{a.clusterTopic}</td>
-                              <td style={{ textAlign: "center", cursor: "pointer" }} onClick={(e) => { e.stopPropagation(); toggleFavorite(a.id); }}>
-                                {activeListIds.has(a.id) ? <span style={{ color: FAVORITE_POINT_COLOR }}>★</span> : <span style={{ color: "#5c6370" }}>☆</span>}
-                              </td>
-                            </tr>
-                          );
-                          return rows;
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
+        <div className="table-dock-wrap">
+          <div className="table-dock">
+            <div className="table-panel" style={{ height: tableHeight }} onClick={(e) => e.stopPropagation()}>
+              <div className="table-resize-handle" onMouseDown={handleTableResizeStart} />
+              {timeDomain ? (
+                <TableTimeFilterBar
+                  domain={timeDomain}
+                  viewMin={tlView.min}
+                  viewMax={tlView.max}
+                  filterMin={tlFilter.min}
+                  filterMax={tlFilter.max}
+                  onViewChange={setTlView}
+                  onFilterChange={handleTimelineFilterChange}
+                  onClearFilter={() => {
+                    if (!timeDomain) return;
+                    setTlFilter({ min: timeDomain.min, max: timeDomain.max });
+                    setTlView({ min: timeDomain.min, max: timeDomain.max });
+                  }}
+                  heatmapStats={heatmapStats}
+                  occurrenceMarkerTimes={occurrenceMarkerTimes}
+                  selectedTimeMs={selectedTimeMsForTimeline}
+                />
+              ) : null}
+              <div className="table-panel-main">
+              <div className="table-header">
+                <span>Abstracts ({sortedTableAbstracts.length})</span>
+              </div>
+              <div className="table-body" ref={tableBodyRef} onScroll={onTableBodyScroll}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th className={`table-sortable${sortCol === "type" ? " table-sort-active" : ""}`} onClick={() => toggleTableSort("type")}>Type{sortCol === "type" ? (sortDir === "asc" ? " \u2191" : " \u2193") : ""}</th>
+                      <th className={`table-sortable${sortCol === "time" ? " table-sort-active" : ""}`} onClick={() => toggleTableSort("time")}>Time{sortCol === "time" ? (sortDir === "asc" ? " \u2191" : " \u2193") : ""}</th>
+                      <th className={`table-sortable${sortCol === "poster" ? " table-sort-active" : ""}`} onClick={() => toggleTableSort("poster")}>Poster{sortCol === "poster" ? (sortDir === "asc" ? " \u2191" : " \u2193") : ""}</th>
+                      <th className={`table-sortable${sortCol === "title" ? " table-sort-active" : ""}`} onClick={() => toggleTableSort("title")}>Title{sortCol === "title" ? (sortDir === "asc" ? " \u2191" : " \u2193") : ""}</th>
+                      <th className={`table-sortable${sortCol === "session" ? " table-sort-active" : ""}`} onClick={() => toggleTableSort("session")}>Session{sortCol === "session" ? (sortDir === "asc" ? " \u2191" : " \u2193") : ""}</th>
+                      <th className={`table-sortable${sortCol === "topic" ? " table-sort-active" : ""}`} onClick={() => toggleTableSort("topic")}>Topic{sortCol === "topic" ? (sortDir === "asc" ? " \u2191" : " \u2193") : ""}</th>
+                      <th className={`table-sortable${sortCol === "fav" ? " table-sort-active" : ""}`} onClick={() => toggleTableSort("fav")}>Fav{sortCol === "fav" ? (sortDir === "asc" ? " \u2191" : " \u2193") : ""}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleTableAbstracts.flatMap((a, idx) => {
+                      const prev = idx === 0 ? null : visibleTableAbstracts[idx - 1];
+                      const showDate =
+                        !prev || formatAgendaDate(parseStartMs(a.start)) !== formatAgendaDate(parseStartMs(prev.start));
+                      const rows = [];
+                      if (showDate) {
+                        rows.push(
+                          <tr key={`agenda-hdr-${a.internalId}-${idx}`} className="table-agenda-date">
+                            <td colSpan={7}>{formatAgendaDate(parseStartMs(a.start))}</td>
+                          </tr>
+                        );
+                      }
+                      rows.push(
+                        <tr key={a.id + String(a.internalId)} onClick={() => { const i = abstracts.findIndex((x) => x.id === a.id); setSelectedId(i >= 0 ? i : null); }}>
+                          <td style={{ whiteSpace: "nowrap", color: a.type === "talk" ? "#b8bcc2" : "#a8b0bc", textTransform: "uppercase", fontSize: 10, letterSpacing: 1 }}>{a.type || "poster"}</td>
+                          <td style={{ whiteSpace: "nowrap", color: "#b0b8c4" }}>{formatAbstractTimeLabel(a.start)}</td>
+                          <td style={{ whiteSpace: "nowrap", color: "#a8b0bc" }}>{a.posterNumber || "—"}</td>
+                          <td style={{ color: "#e4e7ed", maxWidth: 280 }}>{a.title}</td>
+                          <td style={{ maxWidth: 180 }}>{a.session}</td>
+                          <td style={{ color: topicColors[a.clusterTopic], maxWidth: 160 }}>{a.clusterTopic}</td>
+                          <td style={{ textAlign: "center", cursor: "pointer" }} onClick={(e) => { e.stopPropagation(); toggleFavorite(a.id); }}>
+                            {activeListIds.has(a.id) ? <span style={{ color: FAVORITE_POINT_COLOR }}>★</span> : <span style={{ color: "#5c6370" }}>☆</span>}
+                          </td>
+                        </tr>
+                      );
+                      return rows;
+                    })}
+                  </tbody>
+                </table>
+              </div>
               </div>
             </div>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );
