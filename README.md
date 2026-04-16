@@ -55,7 +55,7 @@ Similar research clusters together on the map; distant points are less semantica
 | **Filter by topic** | Topic dropdown (cluster label) |
 | **Filter by session** | Session dropdown |
 | **Favorites** | Star an abstract to save it |
-| **Export** | CSV for all filtered rows or favorites |
+| **Calendar** | Download a calendar file for the current list or favorites only |
 | **Table browser** | Bottom panel; resize with the divider |
 | **Reset view** | Reset zoom and pan |
 
